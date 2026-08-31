@@ -61,25 +61,173 @@ echo "  Python    $("$VENV/bin/python" --version 2>/dev/null || echo 'venv not f
 echo "  Node      $(node --version 2>/dev/null || echo 'not found')"
 echo "  npm       $(npm --version 2>/dev/null || echo 'not found')"
 echo "  Docker    $(docker --version 2>/dev/null || echo 'not found')"
-grep -m1 '^FROM' "$BACKEND_DIR/Dockerfile"  | sed 's/^/  backend image   /'
-grep -m1 '^FROM' "$FRONTEND_DIR/Dockerfile" | sed 's/^/  frontend image  /'
-grep -A2 '^  db:'    "$WORKDIR/docker-compose.yml" | grep image | sed 's/^/  db image       /'
-grep -A2 '^  redis:' "$WORKDIR/docker-compose.yml" | grep image | sed 's/^/  redis image    /'
 
-# ── Backend: Python packages ───────────────────────────────
-upgrade_backend_py() {
-  step "Backend Python packages"
+# ── Comprehensive dependency report — every direct package + every base
+# image, current vs. latest, regardless of mode (not just what's outdated,
+# and not gated behind --major -- that flag only controls whether anything
+# actually gets *changed*). ────────────────────────────────────────────────
+report_backend_packages() {
+  step "Backend Python packages (every direct pin in requirements.txt)"
   cd "$BACKEND_DIR"
-
   if [ ! -d "$VENV" ]; then
     info "Creating venv…"
     python3 -m venv "$VENV" 2>>"$LOG_FILE"
   fi
+  "$VENV/bin/pip" install -q -r requirements-dev.txt 2>>"$LOG_FILE"
 
-  info "Outdated packages:"
-  "$VENV/bin/pip" list --outdated 2>/dev/null || true
+  printf "  %-24s %-12s %-12s %s\n" "PACKAGE" "CURRENT" "LATEST" "STATUS"
+  while IFS= read -r line; do
+    case "$line" in ""|\#*) continue ;; esac
+    spec="${line%%==*}"
+    bare="${spec%%\[*}"
+    cur="${line##*==}"
+    latest=$(curl -s -m 6 "https://pypi.org/pypi/${bare}/json" 2>/dev/null \
+      | "$VENV/bin/python" -c "import json,sys
+try:
+    print(json.load(sys.stdin)['info']['version'])
+except Exception:
+    pass" 2>/dev/null)
+    if [ -z "$latest" ]; then
+      printf "  %-24s %-12s %-12s %s\n" "$spec" "$cur" "?" "(couldn't reach PyPI)"
+    elif [ "$cur" = "$latest" ]; then
+      printf "  %-24s %-12s %-12s %s\n" "$spec" "$cur" "$latest" "up to date"
+    else
+      printf "  %-24s %-12s %-12s %s\n" "$spec" "$cur" "$latest" "-> newer available"
+    fi
+  done < requirements.txt
 
-  if $CHECK_ONLY; then cd "$WORKDIR"; return; fi
+  transitive=$("$VENV/bin/pip" list --outdated 2>/dev/null | tail -n +3)
+  if [ -n "$transitive" ]; then
+    info "Also outdated (transitive — not directly pinned, follows its parent package):"
+    echo "$transitive" | sed 's/^/    /'
+  fi
+  cd "$WORKDIR"
+}
+
+report_frontend_packages() {
+  step "Frontend npm packages (every direct dep in package.json)"
+  cd "$FRONTEND_DIR"
+  printf "  %-24s %-12s %-12s %s\n" "PACKAGE" "CURRENT" "LATEST" "STATUS"
+  node -e "
+    const pkg = require('./package.json');
+    const all = Object.assign({}, pkg.dependencies, pkg.devDependencies);
+    for (const [name, ver] of Object.entries(all)) console.log(name + ' ' + ver);
+  " | while read -r name cur; do
+    latest=$(npm view "$name" version 2>/dev/null)
+    note=""
+    case "$name" in
+      "@types/node") note=" (protected — kept matching the Node LTS major in frontend/Dockerfile)" ;;
+      typescript)    note=" (protected — held below the brand-new native/Go compiler generation)" ;;
+    esac
+    if [ -z "$latest" ]; then
+      printf "  %-24s %-12s %-12s %s\n" "$name" "$cur" "?" "(couldn't reach npm)"
+    elif [ "$cur" = "$latest" ]; then
+      printf "  %-24s %-12s %-12s %s\n" "$name" "$cur" "$latest" "up to date"
+    else
+      printf "  %-24s %-12s %-12s %s\n" "$name" "$cur" "$latest" "-> newer available${note}"
+    fi
+  done
+  cd "$WORKDIR"
+}
+
+report_docker_images() {
+  step "Docker base images"
+  py_tag=$(grep -m1 '^FROM' "$BACKEND_DIR/Dockerfile"  | sed -E 's/.*python:([^ ]+).*/\1/')
+  node_tag=$(grep -m1 '^FROM' "$FRONTEND_DIR/Dockerfile" | sed -E 's/.*node:([^ ]+).*/\1/')
+  pg_tag=$(grep -A2 '^  db:'    "$WORKDIR/docker-compose.yml" | grep image | sed -E 's/.*postgres:([^ ]+).*/\1/')
+  redis_tag=$(grep -A2 '^  redis:' "$WORKDIR/docker-compose.yml" | grep image | sed -E 's/.*redis:([^ ]+).*/\1/')
+
+  python3 - "$py_tag" "$node_tag" "$pg_tag" "$redis_tag" <<'PYEOF'
+import json, sys, urllib.request
+
+def get(url):
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+def cycle_key(c):
+    return tuple(int(x) for x in c.split("."))
+
+def row(service, image, current, recommended, status):
+    print(f"  {service:<10} {image:<10} {current:<16} {recommended or '?':<20} {status}")
+
+py_tag, node_tag, pg_tag, redis_tag = sys.argv[1:5]
+print(f"  {'SERVICE':<10} {'IMAGE':<10} {'CURRENT TAG':<16} {'RECOMMENDED':<20} STATUS")
+
+py_data = get("https://endoflife.date/api/python.json")
+if py_data:
+    newest = sorted(py_data, key=lambda d: cycle_key(d["cycle"]), reverse=True)[0]
+    py_major_minor = py_tag.split("-")[0]
+    if py_major_minor == newest["cycle"]:
+        row("backend", "python", py_tag, f"{newest['latest']}-slim", "up to date (floating tag tracks latest patch)")
+    else:
+        row("backend", "python", py_tag, f"{newest['cycle']}-slim", f"-> newer major.minor available ({newest['cycle']})")
+else:
+    row("backend", "python", py_tag, None, "(couldn't reach endoflife.date)")
+
+node_data = get("https://nodejs.org/dist/index.json")
+if node_data:
+    lts_major = None
+    for d in node_data:
+        if d.get("lts"):
+            lts_major = d["version"].lstrip("v").split(".")[0]
+            break
+    node_major = node_tag.split("-")[0]
+    if lts_major and node_major == lts_major:
+        row("frontend", "node", node_tag, f"{lts_major}-alpine", "up to date (current LTS)")
+    elif lts_major:
+        row("frontend", "node", node_tag, f"{lts_major}-alpine", f"-> newer LTS available ({lts_major})")
+    else:
+        row("frontend", "node", node_tag, None, "(couldn't determine current LTS)")
+else:
+    row("frontend", "node", node_tag, None, "(couldn't reach nodejs.org)")
+
+pg_data = get("https://endoflife.date/api/postgresql.json")
+if pg_data:
+    newest = max(pg_data, key=lambda d: cycle_key(d["cycle"]))
+    pg_major = pg_tag.split("-")[0]
+    if pg_major == newest["cycle"]:
+        row("db", "postgres", pg_tag, f"{newest['cycle']}-alpine", "up to date")
+    else:
+        row("db", "postgres", pg_tag, f"{newest['cycle']}-alpine",
+            f"-> newer major available ({newest['cycle']}) -- needs a manual data migration, see README")
+else:
+    row("db", "postgres", pg_tag, None, "(couldn't reach endoflife.date)")
+
+redis_data = get("https://endoflife.date/api/redis.json")
+if redis_data:
+    newest = max(redis_data, key=lambda d: cycle_key(d["cycle"]))
+    newest_major = str(cycle_key(newest["cycle"])[0])
+    redis_major = redis_tag.split("-")[0]
+    if redis_major == newest_major:
+        row("redis", "redis", redis_tag, f"{newest_major}-alpine", "up to date")
+    else:
+        row("redis", "redis", redis_tag, f"{newest_major}-alpine", f"-> newer major available ({newest_major})")
+else:
+    row("redis", "redis", redis_tag, None, "(couldn't reach endoflife.date)")
+PYEOF
+
+  if $MAJOR && ! $CHECK_ONLY; then
+    cp "$BACKEND_DIR/Dockerfile"  "$BACKEND_DIR/Dockerfile.bak-${BACKUP_SUFFIX}"
+    cp "$FRONTEND_DIR/Dockerfile" "$FRONTEND_DIR/Dockerfile.bak-${BACKUP_SUFFIX}"
+    cp "$WORKDIR/docker-compose.yml" "$WORKDIR/docker-compose.yml.bak-${BACKUP_SUFFIX}"
+    warn "Base images are never auto-edited (bumping a runtime is a deliberate move, and"
+    warn "a Postgres major needs a real data migration, not a tag swap -- see the README's"
+    warn "Upgrading section). Compare the table above and edit the FROM/image lines by hand."
+  fi
+}
+
+report_backend_packages
+report_frontend_packages
+report_docker_images
+
+# ── Backend: Python packages ───────────────────────────────
+upgrade_backend_py() {
+  if $CHECK_ONLY; then return; fi
+  step "Applying backend Python upgrade"
+  cd "$BACKEND_DIR"
 
   cp requirements.txt "requirements.txt.bak-${BACKUP_SUFFIX}"
   cp requirements-dev.txt "requirements-dev.txt.bak-${BACKUP_SUFFIX}"
@@ -118,13 +266,9 @@ upgrade_backend_py() {
 
 # ── Frontend: npm packages ─────────────────────────────────
 upgrade_frontend_npm() {
-  step "Frontend npm packages"
+  if $CHECK_ONLY; then return; fi
+  step "Applying frontend npm upgrade"
   cd "$FRONTEND_DIR"
-
-  info "Outdated packages:"
-  npm outdated --color=always 2>/dev/null || true
-
-  if $CHECK_ONLY; then cd "$WORKDIR"; return; fi
 
   cp package-lock.json "package-lock.json.bak-${BACKUP_SUFFIX}" 2>/dev/null || true
   cp package.json "package.json.bak-${BACKUP_SUFFIX}"
@@ -149,28 +293,6 @@ upgrade_frontend_npm() {
   fi
 
   cd "$WORKDIR"
-}
-
-# ── Docker base images (major-only: bumping a runtime is a deliberate move) ─
-upgrade_docker_images() {
-  step "Docker base images"
-  if ! $MAJOR; then
-    info "Skipped (base image bumps only happen under --major)."
-    return
-  fi
-  if $CHECK_ONLY; then
-    info "Would check Docker Hub for newer python/node/postgres/redis floating tags."
-    return
-  fi
-
-  cp "$BACKEND_DIR/Dockerfile"  "$BACKEND_DIR/Dockerfile.bak-${BACKUP_SUFFIX}"
-  cp "$FRONTEND_DIR/Dockerfile" "$FRONTEND_DIR/Dockerfile.bak-${BACKUP_SUFFIX}"
-  cp "$WORKDIR/docker-compose.yml" "$WORKDIR/docker-compose.yml.bak-${BACKUP_SUFFIX}"
-
-  warn "Base image versions (Python/Node major, Postgres major, Redis major) are not"
-  warn "auto-detected here — verify the current latest LTS/stable tag yourself (e.g."
-  warn "https://endoflife.date, https://nodejs.org/en/about/previous-releases) before"
-  warn "editing the FROM/image lines by hand. This step intentionally does not guess."
 }
 
 # ── Test gate ───────────────────────────────────────────────
@@ -271,16 +393,20 @@ version_summary() {
 }
 
 # ── Main ───────────────────────────────────────────────────
+# (report_backend_packages / report_frontend_packages / report_docker_images
+# already ran above -- the Docker one also created this run's Dockerfile/.yml
+# backups if $MAJOR && !$CHECK_ONLY, since bumping a base image is never
+# auto-applied here regardless of mode.)
 upgrade_backend_py
 upgrade_frontend_npm
-upgrade_docker_images
 
 if run_test_gate; then
-  version_summary
   sep
   if $CHECK_ONLY; then
     info "Check complete — nothing was modified. Re-run without --check to apply upgrades."
   else
+    version_summary
+    sep
     rm -f "$BACKEND_DIR"/*".bak-${BACKUP_SUFFIX}" "$FRONTEND_DIR"/*".bak-${BACKUP_SUFFIX}" "$WORKDIR/docker-compose.yml.bak-${BACKUP_SUFFIX}" 2>/dev/null
     ok "Upgrade complete. Full log: $LOG_FILE"
     if $MAJOR; then

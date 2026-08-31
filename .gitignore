@@ -35,6 +35,9 @@ yarn-error.log*
 pgdata/
 redisdata/
 
+# --- upgrade.sh backups (kept only long enough for a failed run's rollback) -----
+*.bak-*
+
 # --- Editors / OS ----------------------------------------------------------------
 .DS_Store
 Thumbs.db

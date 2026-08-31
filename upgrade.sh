@@ -89,13 +89,25 @@ upgrade_backend_py() {
 
   if $MAJOR; then
     info "Upgrading every top-level package to its latest release…"
-    # requirements.txt here is a flat, top-level-only pin list (no transitive locks),
-    # so upgrading each named package and re-freezing just those names is safe and
-    # keeps the file in its existing hand-maintained style.
-    names=$(sed -E 's/(\[[a-z]+\])?(==.*)?$//' requirements.txt | sed '/^\s*$/d')
-    for pkg in $names; do
-      "$VENV/bin/pip" install -q -U "$pkg" 2>>"$LOG_FILE" || warn "Could not upgrade $pkg — check $LOG_FILE"
-    done
+    # requirements.txt here is a flat, top-level-only pin list (no transitive locks).
+    # Install each full spec (name[extras]) so extras' bundled deps (e.g. uvicorn's
+    # uvloop/httptools) get resolved fresh too, then re-pin each line to whatever
+    # version actually landed -- installing alone does NOT rewrite the file.
+    tmp_req=$(mktemp)
+    while IFS= read -r line; do
+      case "$line" in ""|\#*) echo "$line" >> "$tmp_req"; continue ;; esac
+      spec="${line%%==*}"          # e.g. "uvicorn[standard]"
+      bare="${spec%%\[*}"          # e.g. "uvicorn"
+      "$VENV/bin/pip" install -q -U "$spec" 2>>"$LOG_FILE" || warn "Could not upgrade $bare — check $LOG_FILE"
+      new_ver=$("$VENV/bin/pip" show "$bare" 2>/dev/null | awk '/^Version:/{print $2}')
+      if [ -n "$new_ver" ]; then
+        echo "${spec}==${new_ver}" >> "$tmp_req"
+      else
+        echo "$line" >> "$tmp_req"   # couldn't resolve -- keep the original pin
+      fi
+    done < requirements.txt
+    mv "$tmp_req" requirements.txt
+    ok "requirements.txt re-pinned to the upgraded versions"
   else
     info "Upgrading within current majors is not automated for pip (no lock ranges to respect) — re-run with --major, or hand-edit pins for a minor/patch-only bump."
   fi
@@ -119,7 +131,12 @@ upgrade_frontend_npm() {
 
   if $MAJOR; then
     info "Lifting semver ranges with npm-check-updates…"
-    npx --yes npm-check-updates -u 2>>"$LOG_FILE" && ok "package.json ranges updated"
+    # @types/node is pinned to match the Node major in frontend/Dockerfile, not
+    # npm's bare "latest" -- it must move by hand alongside a future Node bump.
+    # typescript is deliberately held below its brand-new native/Go compiler
+    # generation until it has had time to mature. Both are conscious choices,
+    # not staleness -- see README/upgrade.sh notes before lifting either by hand.
+    npx --yes npm-check-updates -u --reject @types/node,typescript 2>>"$LOG_FILE" && ok "package.json ranges updated"
   else
     info "Updating within declared semver ranges…"
   fi
@@ -264,6 +281,7 @@ if run_test_gate; then
   if $CHECK_ONLY; then
     info "Check complete — nothing was modified. Re-run without --check to apply upgrades."
   else
+    rm -f "$BACKEND_DIR"/*".bak-${BACKUP_SUFFIX}" "$FRONTEND_DIR"/*".bak-${BACKUP_SUFFIX}" "$WORKDIR/docker-compose.yml.bak-${BACKUP_SUFFIX}" 2>/dev/null
     ok "Upgrade complete. Full log: $LOG_FILE"
     if $MAJOR; then
       warn "Major version bumps were applied. Review each package's changelog and, for a"

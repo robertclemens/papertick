@@ -107,7 +107,10 @@ except Exception:
 
   transitive=$("$VENV/bin/pip" list --outdated 2>/dev/null | tail -n +3)
   if [ -n "$transitive" ]; then
-    info "Also outdated (transitive — not directly pinned, follows its parent package):"
+    info "Also outdated (transitive — not directly pinned, follows its parent package)."
+    info "Often not actually movable: e.g. pydantic hard-pins its exact pydantic-core"
+    info "build and refuses to import on a mismatch, so this list can show a newer"
+    info "version existing on PyPI that no compatible parent release has adopted yet."
     echo "$transitive" | sed 's/^/    /'
   fi
   cd "$WORKDIR"

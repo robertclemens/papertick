@@ -1,8 +1,8 @@
 # PaperTick
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)
-![Node 20](https://img.shields.io/badge/node-20-green.svg)
+![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)
+![Node 24 LTS](https://img.shields.io/badge/node-24_LTS-green.svg)
 ![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED.svg)
 
 A production-grade **mock investment platform**: paper trading, historical backtesting,
@@ -32,12 +32,14 @@ No real money, real market discipline.
 
 | Layer | Technology |
 |---|---|
-| Frontend | Next.js 14 (App Router) · React · TailwindCSS · Recharts |
-| Backend | Python 3.12 · FastAPI · SQLAlchemy 2 · Pydantic v2 |
-| Database | PostgreSQL 16 (ACID ledger, `SELECT … FOR UPDATE` locking) |
-| Queue / cache | Redis 7 + Celery (worker + beat) |
+| Frontend | Next.js 16 (App Router) · React 19 · Tailwind CSS 4 · Recharts 3 |
+| Backend | Python 3.14 · FastAPI · SQLAlchemy 2 · Pydantic v2 |
+| Database | PostgreSQL 18 (ACID ledger, `SELECT … FOR UPDATE` locking) |
+| Queue / cache | Redis 8 + Celery (worker + beat) |
 | Market data | Yahoo Finance (live) with deterministic synthetic fallback (offline-safe) |
 | Infra | Docker Compose (rootless-Docker friendly, no privileged ports) |
+
+Kept current with [`upgrade.sh`](upgrade.sh) — see [Upgrading](#upgrading).
 
 ## Project structure
 
@@ -446,6 +448,37 @@ docker compose up -d --build
   `docker-compose.yml`, so an upgrade won't break an existing `.env` that's
   missing them — diff the two files after pulling to see what's new and worth
   setting explicitly.
+
+### Dependency upgrades
+
+[`upgrade.sh`](upgrade.sh) bumps Python packages, npm packages, and (under `--major`)
+the four Docker base images, gated behind a test run (`pytest`, `tsc --noEmit`,
+`next build`, then a containerized `/healthz` check) that auto-rolls-back on failure:
+
+```bash
+./upgrade.sh --check          # see what's outdated, change nothing
+./upgrade.sh                  # bump within current majors
+./upgrade.sh --major          # cross major versions too (review changelogs after)
+```
+
+**Postgres major-version upgrades need a manual data migration** — a Postgres data
+directory isn't binary-compatible across major versions, so swapping the image tag
+alone will not work (the container simply refuses to start against an incompatible
+volume; Postgres 18's image additionally changed its expected mount point from
+`.../postgresql/data` to `.../postgresql` — already reflected in this repo's
+`docker-compose.yml`). `upgrade.sh` deliberately does not automate this. The safe
+sequence, if you're bumping the `db` image to a new major:
+
+```bash
+docker compose exec -T db pg_dump -U papertick -d papertick --format=custom > backup.dump
+# point docker-compose.yml's pgdata volume at a new name so the old volume is left
+# untouched as a fallback, then bring the new image up on the fresh volume:
+docker compose up -d db
+docker compose cp backup.dump db:/tmp/backup.dump
+docker compose exec -T db pg_restore -U papertick -d papertick --no-owner --role=papertick /tmp/backup.dump
+```
+
+Verify row counts against the old volume before removing it (`docker run --rm -v <old-volume>:/var/lib/postgresql/data postgres:<old-tag> ...` to spin up a throwaway read-only check).
 
 ## License
 

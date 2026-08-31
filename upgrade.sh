@@ -11,6 +11,14 @@
 # Usage:
 #   ./upgrade.sh              # safe mode: upgrade within the current major version of each package
 #   ./upgrade.sh --major      # also cross major versions (Docker base images only move under this flag)
+#   ./upgrade.sh --major --force  # --major, and also lift the deliberate typescript hold (still
+#                                  #   below its brand-new native/Go 7.x compiler by default). Does
+#                                  #   NOT touch @types/node's Node-LTS pairing -- that's a
+#                                  #   correctness constraint, not caution, and --force isn't the
+#                                  #   right lever for it (bump it by hand alongside a Node bump).
+#                                  #   Runs the full test gate exactly like any other run and rolls
+#                                  #   back automatically on failure -- this is how you try
+#                                  #   typescript@7 against the real codebase safely.
 #   ./upgrade.sh --check      # print the full dependency report and stop; nothing is changed
 #   ./upgrade.sh --skip-tests # upgrade and skip the test gate (not recommended)
 #
@@ -38,6 +46,7 @@ LOG_FILE="/tmp/papertick-upgrade.log"
 MAJOR=false
 CHECK_ONLY=false
 SKIP_TESTS=false
+FORCE=false
 BACKUP_SUFFIX=$(date +%Y%m%d%H%M%S)
 
 for arg in "$@"; do
@@ -45,7 +54,8 @@ for arg in "$@"; do
     --major)      MAJOR=true ;;
     --check)      CHECK_ONLY=true ;;
     --skip-tests) SKIP_TESTS=true ;;
-    *) err "Unknown argument: $arg"; echo "Usage: $0 [--major] [--check] [--skip-tests]"; exit 1 ;;
+    --force)      FORCE=true ;;
+    *) err "Unknown argument: $arg"; echo "Usage: $0 [--major [--force]] [--check] [--skip-tests]"; exit 1 ;;
   esac
 done
 
@@ -55,6 +65,12 @@ if $MAJOR; then
   warn "Running in --major mode: package majors AND Docker base images (Python/Node/Postgres/Redis) may move. Breaking changes are possible — review the test gate output carefully."
 elif $CHECK_ONLY; then
   info "Running in --check mode. Nothing will be modified."
+fi
+if $FORCE && ! $MAJOR; then
+  warn "--force has no effect without --major -- nothing is held back outside --major mode. Use: ./upgrade.sh --major --force"
+fi
+if $FORCE && $MAJOR; then
+  warn "--force: lifting the typescript hold too -- it may land on the brand-new native/Go 7.x compiler. @types/node stays pinned to the Node LTS major regardless (that's a correctness pairing, not caution)."
 fi
 if $SKIP_TESTS; then
   warn "--skip-tests: the pytest/tsc/build/healthz gate is disabled. A broken upgrade will not be caught automatically."
@@ -129,7 +145,13 @@ report_frontend_packages() {
     note=""
     case "$name" in
       "@types/node") note=" (protected — kept matching the Node LTS major in frontend/Dockerfile)" ;;
-      typescript)    note=" (protected — held below the brand-new native/Go compiler generation)" ;;
+      typescript)
+        if $MAJOR && $FORCE; then
+          note=" (hold lifted this run by --major --force)"
+        else
+          note=" (protected — held below the brand-new native/Go compiler generation; lift with --major --force)"
+        fi
+        ;;
     esac
     if [ -z "$latest" ]; then
       printf "  %-24s %-12s %-12s %s\n" "$name" "$cur" "?" "(couldn't reach npm)"
@@ -288,11 +310,16 @@ upgrade_frontend_npm() {
   if $MAJOR; then
     info "Lifting semver ranges with npm-check-updates…"
     # @types/node is pinned to match the Node major in frontend/Dockerfile, not
-    # npm's bare "latest" -- it must move by hand alongside a future Node bump.
-    # typescript is deliberately held below its brand-new native/Go compiler
-    # generation until it has had time to mature. Both are conscious choices,
-    # not staleness -- see README/upgrade.sh notes before lifting either by hand.
-    npx --yes npm-check-updates -u --reject @types/node,typescript 2>>"$LOG_FILE" && ok "package.json ranges updated"
+    # npm's bare "latest" -- it must move by hand alongside a future Node bump,
+    # never via --force (that's a correctness pairing, not caution).
+    # typescript is held below its brand-new native/Go compiler generation by
+    # default; --force lifts that specific hold to let you try it for real
+    # against this codebase, gated by the same test gate as everything else.
+    if $FORCE; then
+      npx --yes npm-check-updates -u --reject @types/node 2>>"$LOG_FILE" && ok "package.json ranges updated (typescript hold lifted by --force)"
+    else
+      npx --yes npm-check-updates -u --reject @types/node,typescript 2>>"$LOG_FILE" && ok "package.json ranges updated"
+    fi
   else
     info "Updating within declared semver ranges…"
   fi

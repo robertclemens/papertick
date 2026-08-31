@@ -1,0 +1,47 @@
+# --- Secrets & local config -------------------------------------------------
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+
+# --- Python / backend --------------------------------------------------------
+*.pyc
+__pycache__/
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.sqlite3
+
+# --- Node / frontend ----------------------------------------------------------
+node_modules/
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.vercel
+
+# --- Data & infra --------------------------------------------------------------
+pgdata/
+redisdata/
+
+# --- Editors / OS ----------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Project-internal ------------------------------------------------------------
+# Internal development blueprint; not part of the shipped application.
+CLAUDE.md

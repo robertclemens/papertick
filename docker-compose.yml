@@ -1,0 +1,119 @@
+name: papertick
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+psycopg://papertick:${POSTGRES_PASSWORD}@db:5432/papertick
+  REDIS_URL: redis://redis:6379/0
+  SECRET_KEY: ${SECRET_KEY}
+  ENV: ${ENV:-development}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+  MARKET_DATA_PROVIDER: ${MARKET_DATA_PROVIDER:-auto}
+  POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+  ALPACA_API_KEY_ID: ${ALPACA_API_KEY_ID:-}
+  ALPACA_API_SECRET: ${ALPACA_API_SECRET:-}
+  ENFORCE_MARKET_HOURS: ${ENFORCE_MARKET_HOURS:-true}
+  ALLOW_BACKDATED_TRADES: ${ALLOW_BACKDATED_TRADES:-false}
+  SETTLEMENT_YIELD_ANNUAL: ${SETTLEMENT_YIELD_ANNUAL:-0}
+  SCENARIO_RETENTION_DAYS: ${SCENARIO_RETENTION_DAYS:-30}
+  TRADE_FEE_USD: ${TRADE_FEE_USD:-0.00}
+  SLIPPAGE_BPS: ${SLIPPAGE_BPS:-2}
+  OPTION_FEE_PER_CONTRACT: ${OPTION_FEE_PER_CONTRACT:-0.65}
+  RISK_FREE_RATE: ${RISK_FREE_RATE:-0.045}
+  ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-900}
+  REFRESH_TOKEN_TTL_SECONDS: ${REFRESH_TOKEN_TTL_SECONDS:-604800}
+  LOGIN_MAX_FAILURES: ${LOGIN_MAX_FAILURES:-10}
+  LOGIN_LOCKOUT_SECONDS: ${LOGIN_LOCKOUT_SECONDS:-900}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_FROM: ${SMTP_FROM:-PaperTick <no-reply@papertick.example>}
+  SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+  EMAIL_TOKEN_TTL_SECONDS: ${EMAIL_TOKEN_TTL_SECONDS:-86400}
+  WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-}
+  WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME:-PaperTick}
+  DEMO_MODE: ${DEMO_MODE:-false}
+  DEMO_EMAIL: ${DEMO_EMAIL:-}
+  DEMO_PASSWORD: ${DEMO_PASSWORD:-}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: papertick
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: papertick
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U papertick -d papertick"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    environment: *backend-env
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build: ./backend
+    command: ["celery", "-A", "app.workers.celery_app", "beat", "--loglevel=INFO", "--schedule", "/tmp/celerybeat-schedule"]
+    environment: *backend-env
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        BACKEND_URL: http://backend:8000
+    environment:
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

@@ -49,3 +49,4 @@ Thumbs.db
 # --- Project-internal ------------------------------------------------------------
 # Internal development blueprint; not part of the shipped application.
 CLAUDE.md
+security.md

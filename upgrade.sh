@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# upgrade.sh — upgrades all PaperTick dependencies: Python packages, npm packages,
-# and the four Docker base images (Python, Node, Postgres, Redis).
+# upgrade.sh — upgrades all PaperTick dependencies: every direct package in
+# requirements.txt and package.json, and the four Docker base images
+# (Python, Node, Postgres, Redis).
+#
+# Every run (any mode, including --check) first prints a full report: every
+# direct dependency with its current pin and the actual latest release, not
+# just the ones that happen to be outdated — this is the source of truth for
+# "are we current," not something --check does differently from the rest.
 #
 # Usage:
 #   ./upgrade.sh              # safe mode: upgrade within the current major version of each package
 #   ./upgrade.sh --major      # also cross major versions (Docker base images only move under this flag)
-#   ./upgrade.sh --check      # print what's outdated without changing anything
+#   ./upgrade.sh --check      # print the full dependency report and stop; nothing is changed
 #   ./upgrade.sh --skip-tests # upgrade and skip the test gate (not recommended)
 #
 # Test gate (runs after upgrade, before rebuilding/restarting containers):

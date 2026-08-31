@@ -1,6 +1,6 @@
 from datetime import date, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -21,9 +21,18 @@ router = APIRouter(prefix="/market", tags=["market"],
 
 def _require_asset(db: Session, ticker: str) -> Asset:
     """Known asset, or auto-registration of any validated US-listed symbol."""
-    asset = require_asset(db, ticker.upper())
+    asset = require_asset(db, ticker)
     db.commit()
     return asset
+
+
+def _like(term: str) -> str:
+    """Escape a user substring for LIKE/ILIKE.
+
+    Unescaped, `%` and `_` are wildcards the caller gets to inject: a query of
+    a single `%` matches the whole table on every request.
+    """
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 @router.get("/status", response_model=MarketStatusOut)
@@ -51,11 +60,13 @@ def search_symbols(
 ) -> list[dict]:
     """Search by ticker OR company/fund name. Merges the local asset table with
     the live provider's symbol search, local matches first."""
-    like_t = f"%{q.upper()}%"
+    term = _like(q)
+    like_t = f"%{term.upper()}%"
     local = db.execute(
         select(Asset)
         .where(
-            or_(Asset.ticker.like(like_t), Asset.name.ilike(f"%{q}%")),
+            or_(Asset.ticker.like(like_t, escape="\\"),
+                Asset.name.ilike(f"%{term}%", escape="\\")),
             Asset.ticker != settlement.TICKER,  # the settlement fund is not tradable
         )
         .order_by(Asset.ticker)
@@ -90,14 +101,16 @@ def list_assets(
     # the settlement fund is held, never bought or sold, so it is not offered
     q = select(Asset).where(Asset.ticker != settlement.TICKER).order_by(Asset.ticker)
     if query:
-        like = f"%{query.upper()}%"
-        q = q.where(or_(Asset.ticker.like(like), Asset.name.ilike(f"%{query}%")))
+        term = _like(query)
+        q = q.where(or_(Asset.ticker.like(f"%{term.upper()}%", escape="\\"),
+                        Asset.name.ilike(f"%{term}%", escape="\\")))
     return [AssetOut.model_validate(a) for a in db.execute(q.limit(50)).scalars()]
 
 
 @router.get("/quote/{ticker}", response_model=QuoteOut,
             dependencies=[Depends(rate_limiter("quote", 120, 60))])
-def get_quote(ticker: str, db: Session = Depends(get_db)) -> QuoteOut:
+def get_quote(ticker: str = Path(min_length=1, max_length=12),
+              db: Session = Depends(get_db)) -> QuoteOut:
     """Latest price for a ticker, auto-registering it first if it is not
     already known (any validated US-listed symbol qualifies). Includes the
     previous close, the percent change computed from it, and which upstream
@@ -119,7 +132,7 @@ def get_quote(ticker: str, db: Session = Depends(get_db)) -> QuoteOut:
 @router.get("/history/{ticker}", response_model=HistoryOut,
             dependencies=[Depends(rate_limiter("history", 60, 60))])
 def get_history(
-    ticker: str,
+    ticker: str = Path(min_length=1, max_length=12),
     start: date | None = None,
     end: date | None = None,
     db: Session = Depends(get_db),

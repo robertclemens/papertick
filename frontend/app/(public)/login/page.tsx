@@ -11,9 +11,10 @@ import { ErrorText, InfoText } from "@/components/ui";
  *
  *  1. email
  *  2. password — or a passkey, which replaces the password entirely
- *  3. authenticator code, only on the password path and only when the account
- *     has one. A passkey is already two factors (the device plus the biometric
- *     or PIN that unlocked it), so it never gets a third step.
+ *  3. authenticator code, whenever the account has one enrolled. Both the
+ *     password and the passkey path go through it: a passkey proves possession
+ *     of a registered authenticator, which is not a substitute for the second
+ *     factor the user deliberately turned on.
  *
  *  The email step deliberately does NOT ask the server which methods an
  *  account has: an endpoint that answers "this address has a passkey" is an
@@ -49,7 +50,15 @@ export default function LoginPage() {
     setError("");
     setBusy(true);
     try {
-      await signInWithPasskey();
+      const res = await signInWithPasskey();
+      if (res.mfa_required) {
+        // The account has an authenticator enrolled, so the passkey is the
+        // first factor here, not both.
+        setMfaToken(res.mfa_token);
+        setStep("mfa");
+        setBusy(false);
+        return;
+      }
       router.push("/");
       router.refresh();
     } catch (err) {

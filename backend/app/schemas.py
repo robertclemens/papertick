@@ -1,5 +1,6 @@
 """Pydantic request/response models. Strict input validation at the boundary."""
 
+import re
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
@@ -25,6 +26,22 @@ from app.models import (
     StatementKind,
     TimeInForce,
 )
+
+# A US listing: a letter, then letters/digits/dots/hyphens, up to 12 chars.
+# Symbols reach an upstream provider's URL path and a cache key, so the shape is
+# pinned here rather than trusted from the caller.
+TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,11}$")
+
+
+def _ticker(value: str) -> str:
+    candidate = (value or "").strip().upper()
+    if not TICKER_RE.fullmatch(candidate):
+        raise ValueError(
+            "must be 1-12 characters: a letter followed by letters, digits, "
+            "dots or hyphens"
+        )
+    return candidate
+
 
 MAX_MONEY = Decimal("10000000")
 MAX_SHARES = Decimal("1000000000")
@@ -63,6 +80,13 @@ class MfaLoginIn(BaseModel):
 
 class MfaCodeIn(BaseModel):
     code: str = Field(min_length=6, max_length=8)
+
+
+class MfaSetupIn(BaseModel):
+    """Starting TOTP enrolment returns the secret itself, so it re-proves the
+    password rather than trusting the session cookie alone."""
+
+    current_password: str = Field(min_length=1, max_length=512)
 
 
 class MfaDisableIn(MfaCodeIn):
@@ -200,6 +224,14 @@ class PasskeyOut(ORMModel):
     transports: str | None
     created_at: datetime
     last_used_at: datetime | None
+
+
+class PasskeyRegisterStartIn(BaseModel):
+    """Step-up for adding a passkey: a passkey survives a password change, so
+    enrolling one re-proves the password (and TOTP, when enrolled)."""
+
+    current_password: str = Field(min_length=1, max_length=512)
+    code: str | None = Field(default=None, min_length=6, max_length=8)
 
 
 class PasskeyRegisterVerifyIn(BaseModel):
@@ -398,7 +430,7 @@ class OrderCreateIn(BaseModel):
     @field_validator("ticker")
     @classmethod
     def _upper(cls, v: str) -> str:
-        return v.strip().upper()
+        return _ticker(v)
 
     @field_validator("quantity")
     @classmethod
@@ -515,7 +547,7 @@ class ExchangeIn(BaseModel):
     @field_validator("from_ticker", "to_ticker")
     @classmethod
     def _upper(cls, v: str) -> str:
-        return v.strip().upper()
+        return _ticker(v)
 
 
 class ExchangeLotOut(BaseModel):
@@ -602,7 +634,7 @@ class ScheduleCreateIn(BaseModel):
     @field_validator("ticker")
     @classmethod
     def _upper(cls, v: str) -> str:
-        return v.strip().upper()
+        return _ticker(v)
 
 
 class ScheduleUpdateIn(BaseModel):
@@ -619,7 +651,7 @@ class ScheduleUpdateIn(BaseModel):
     @field_validator("ticker")
     @classmethod
     def _upper(cls, v: str | None) -> str | None:
-        return v.strip().upper() if v else v
+        return _ticker(v) if v else v
 
 
 class ScheduleOut(ORMModel):
@@ -782,7 +814,7 @@ class OptionOrderIn(BaseModel):
     @field_validator("underlying")
     @classmethod
     def _upper(cls, v: str) -> str:
-        return v.strip().upper()
+        return _ticker(v)
 
 
 class OptionCloseIn(BaseModel):

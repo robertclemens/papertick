@@ -12,7 +12,14 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import ACCESS_COOKIE, REFRESH_COOKIE, Principal, get_principal, require_manage
 from app.models import RefreshToken, User, utcnow
-from app.rate_limit import clear_login_failures, is_locked_out, rate_limiter, record_login_failure
+from app.rate_limit import (
+    clear_login_failures,
+    client_ip,
+    enforce_account_limit,
+    is_locked_out,
+    rate_limiter,
+    record_login_failure,
+)
 from app.schemas import (
     DobImpactOut,
     EmailTokenIn,
@@ -21,6 +28,7 @@ from app.schemas import (
     MfaCodeIn,
     MfaDisableIn,
     MfaLoginIn,
+    MfaSetupIn,
     PasswordChangeIn,
     ProfileUpdateIn,
     ProfileUpdateOut,
@@ -39,6 +47,15 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # Argon2 hash of a random throwaway password; verified against on unknown
 # emails so response timing does not reveal whether an account exists.
 _DUMMY_HASH = security.hash_password("t1m1ng-3qual1zer-Xq9!padding")
+
+# One message for every credential failure, so responses never distinguish
+# "no such account" from "wrong password" from "this source is locked out".
+INVALID_LOGIN = "Invalid email or password"
+
+
+def _bearer(request: Request) -> str | None:
+    auth = request.headers.get("authorization", "")
+    return auth[7:].strip() if auth.lower().startswith("bearer ") else None
 
 
 def _set_cookies(response: Response, access: str, refresh: str) -> None:
@@ -85,10 +102,20 @@ def signup(data: SignupIn, response: Response, db: Session = Depends(get_db)) ->
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     email = data.email.lower()
+    # Per-address as well as per-source: behind the bundled proxy the per-IP
+    # bucket is shared by everyone, so this is what stops one caller from
+    # spending the whole signup allowance.
+    enforce_account_limit("signup", email, 5, 3600)
+    production = get_settings().is_production
     exists = db.execute(select(User.id).where(User.email == email)).first()
     if exists:
+        if production:
+            # Confirming that an address is already registered is free account
+            # enumeration. Outside production the explicit 409 is kept, since
+            # developers hit this constantly and there is nothing to protect.
+            log.info("signup attempted for an existing address")
+            return LoginOut(verification_required=True)
         raise HTTPException(status_code=409, detail="An account with this email already exists")
-    production = get_settings().is_production
     user = User(
         email=email,
         password_hash=security.hash_password(data.password),
@@ -107,29 +134,34 @@ def signup(data: SignupIn, response: Response, db: Session = Depends(get_db)) ->
 
 @router.post("/login", response_model=LoginOut,
              dependencies=[Depends(rate_limiter("login", 20, 60))])
-def login(data: LoginIn, response: Response, db: Session = Depends(get_db)) -> LoginOut:
+def login(data: LoginIn, request: Request, response: Response,
+          db: Session = Depends(get_db)) -> LoginOut:
     """First step of the password login path: checks credentials against the
     lockout window and, in production, requires a verified email. If MFA is
     enrolled it returns an `mfa_token` for `/login/mfa` instead of session
     tokens; unknown emails are checked against a dummy hash so response
     timing doesn't reveal whether the account exists."""
     email = data.email.lower()
-    if is_locked_out(email):
-        raise HTTPException(status_code=429, detail="Account temporarily locked after repeated failures. Try again later.")
+    enforce_account_limit("login", email, 30, 300)
+    ip = client_ip(request)
+    # A locked source gets the same 401 as a wrong password: a distinct status
+    # would confirm the address belongs to a real account.
+    if is_locked_out(email, ip):
+        raise HTTPException(status_code=401, detail=INVALID_LOGIN)
     user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
     if user is None:
         security.verify_password(data.password, _DUMMY_HASH)
-        record_login_failure(email)
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        record_login_failure(email, ip)
+        raise HTTPException(status_code=401, detail=INVALID_LOGIN)
     if not security.verify_password(data.password, user.password_hash) or not user.is_active:
-        record_login_failure(email)
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        record_login_failure(email, ip)
+        raise HTTPException(status_code=401, detail=INVALID_LOGIN)
     if get_settings().is_production and not user.email_verified:
         raise HTTPException(
             status_code=403,
             detail="Email not verified. Check your inbox for the confirmation link, or request a new one.",
         )
-    clear_login_failures(email)
+    clear_login_failures(email, ip)
     if security.password_needs_rehash(user.password_hash):
         user.password_hash = security.hash_password(data.password)
         db.commit()
@@ -140,7 +172,8 @@ def login(data: LoginIn, response: Response, db: Session = Depends(get_db)) -> L
 
 @router.post("/login/mfa", response_model=LoginOut,
              dependencies=[Depends(rate_limiter("mfa", 15, 60))])
-def login_mfa(data: MfaLoginIn, response: Response, db: Session = Depends(get_db)) -> LoginOut:
+def login_mfa(data: MfaLoginIn, request: Request, response: Response,
+              db: Session = Depends(get_db)) -> LoginOut:
     """Completes the password login path using the `mfa_token` returned by
     `/login`: verifies the TOTP code and, on success, issues session tokens.
     The token is short-lived and only valid for this step."""
@@ -150,11 +183,14 @@ def login_mfa(data: MfaLoginIn, response: Response, db: Session = Depends(get_db
     user = db.get(User, payload["sub"])
     if user is None or not user.is_active or not user.mfa_enabled or not user.mfa_secret_enc:
         raise HTTPException(status_code=401, detail="Invalid or expired MFA token, log in again")
+    ip = client_ip(request)
+    if is_locked_out(user.email, ip):
+        raise HTTPException(status_code=401, detail="Invalid authentication code")
     secret = security.open_totp_secret(user.mfa_secret_enc)
     if secret is None or not security.verify_totp(secret, data.code):
-        record_login_failure(user.email)
+        record_login_failure(user.email, ip)
         raise HTTPException(status_code=401, detail="Invalid authentication code")
-    clear_login_failures(user.email)
+    clear_login_failures(user.email, ip)
     return LoginOut(tokens=_issue_tokens(db, user, response))
 
 
@@ -201,8 +237,11 @@ def refresh(request: Request, response: Response, db: Session = Depends(get_db))
 
 @router.post("/logout", status_code=204)
 def logout(request: Request, response: Response, db: Session = Depends(get_db)) -> Response:
-    """Revokes the current session's refresh token and clears the auth
-    cookies; other active sessions for the user are left untouched."""
+    """Revokes the current session's refresh token and access token and clears
+    the auth cookies; other active sessions for the user are left untouched."""
+    access = request.cookies.get(ACCESS_COOKIE) or _bearer(request)
+    if access:
+        security.revoke_access_token(access)
     raw = request.cookies.get(REFRESH_COOKIE)
     if raw:
         db.query(RefreshToken).filter(
@@ -338,6 +377,10 @@ def change_password(data: PasswordChangeIn, response: Response,
         RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None)
     ).update({"revoked_at": utcnow()})
     db.commit()
+    # Refresh tokens alone are not enough: every access token already issued
+    # stays valid for its full lifetime, so a password change would not
+    # actually evict a session the user does not control.
+    security.revoke_all_access_tokens(user.id)
     _issue_tokens(db, user, response)
     log.info("password changed for %s", user.id)
     return UserOut.model_validate(user)
@@ -417,13 +460,21 @@ def update_profile(data: ProfileUpdateIn, principal: Principal = Depends(require
 
 # ------------------------------------------------------------------ MFA
 
-@router.post("/mfa/setup")
-def mfa_setup(principal: Principal = Depends(require_manage), db: Session = Depends(get_db)) -> dict:
+@router.post("/mfa/setup", dependencies=[Depends(rate_limiter("mfa-setup", 10, 3600))])
+def mfa_setup(data: MfaSetupIn, principal: Principal = Depends(require_manage),
+              db: Session = Depends(get_db)) -> dict:
     """Generates a new TOTP secret and stores it encrypted on the user, but
     does not turn MFA on yet — `/mfa/enable` with a valid code does that.
     Returns the raw secret, its otpauth URI, and a QR code SVG for
-    authenticator apps to scan."""
+    authenticator apps to scan.
+
+    Requires the current password: this response *is* the second factor, so
+    handing it out on a session cookie alone would let a hijacked session mint
+    itself one. Disabling MFA already asks for the password; enrolling should
+    match."""
     user = principal.user
+    if not security.verify_password(data.current_password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
     if user.mfa_enabled:
         raise HTTPException(status_code=409, detail="MFA is already enabled")
     secret = security.new_totp_secret()

@@ -27,6 +27,8 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.db import for_update
+
 from app.config import get_settings
 from app.models import (
     Account,
@@ -223,6 +225,7 @@ def auto_fund(db: Session, account: Account, shortfall: Decimal, memo: str) -> D
     tax year so it counts against the limit). Raises FundingError when the
     transfer is not permitted. Caller commits."""
     from app.models import CashFlowKind, Contribution
+    from app.services import irs
 
     if shortfall <= 0:
         return ZERO
@@ -235,6 +238,10 @@ def auto_fund(db: Session, account: Account, shortfall: Decimal, memo: str) -> D
             "A Rollover IRA takes rollover money only, so a bank transfer cannot "
             "cover this order — sell something or roll funds in first"
         )
+    # Same rule as a manual deposit: the shared IRA limit is checked and
+    # consumed in one atomic step, so lock every account it spans first.
+    if account.account_type in irs.IRA_LIKE:
+        irs.lock_contribution_scope(db, db.get(User, account.user_id), account.scenario_id)
     available = fundable_amount(db, account)
     if available < shortfall:
         if account.account_type == AccountType.TAXABLE:
@@ -358,10 +365,27 @@ _ITYPE_MAP = {
 }
 
 
+def valid_ticker(ticker: str) -> str:
+    """Normalise and validate a symbol, or raise 422.
+
+    The value reaches an upstream provider's URL path and a Redis cache key, so
+    it is checked once, here, before any lookup — an unbounded path parameter
+    would otherwise let a caller reshape the provider request (`?`, `#`, `../`)
+    or wedge a NUL byte into a Postgres text column.
+    """
+    from app.schemas import _ticker
+
+    try:
+        return _ticker(ticker)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Ticker {exc}")
+
+
 def require_asset(db: Session, ticker: str) -> Asset:
     """Return the asset, auto-registering any USD-denominated US-listed symbol
     the live data source recognizes (curated seed assets carry real category /
     region / prospectus metadata; auto-registered ones default to OTHER)."""
+    ticker = valid_ticker(ticker)
     asset = db.get(Asset, ticker)
     if asset is not None:
         return asset
@@ -679,12 +703,15 @@ def expire_due_orders(db: Session, now: datetime | None = None) -> int:
     from app.services.scenarios import frozen_accounts
 
     due = db.execute(
-        select(Order).where(
-            Order.status == OrderStatus.PENDING,
-            Order.expires_at.isnot(None),
-            Order.expires_at <= now,
-            Order.account_id.notin_(frozen_accounts(db)),
-        ).with_for_update(skip_locked=True)
+        for_update(
+            select(Order).where(
+                Order.status == OrderStatus.PENDING,
+                Order.expires_at.isnot(None),
+                Order.expires_at <= now,
+                Order.account_id.notin_(frozen_accounts(db)),
+            ),
+            skip_locked=True,
+        )
     ).scalars().all()
     for order in due:
         order.status = OrderStatus.EXPIRED
@@ -740,18 +767,20 @@ def execute_fill(db: Session, order: Order, price: Decimal, as_of: date) -> Tran
     rows; caller commits. Business rejections mark the order REJECTED and
     return None."""
     account = db.execute(
-        select(Account).where(Account.id == order.account_id).with_for_update()
+        for_update(select(Account).where(Account.id == order.account_id))
     ).scalar_one()
     position = db.execute(
-        select(Position)
-        .where(Position.account_id == account.id, Position.ticker == order.ticker)
-        .with_for_update()
+        for_update(
+            select(Position)
+            .where(Position.account_id == account.id, Position.ticker == order.ticker)
+        )
     ).scalar_one_or_none()
     lots = list(db.execute(
-        select(TaxLot)
-        .where(TaxLot.account_id == account.id, TaxLot.ticker == order.ticker)
-        .order_by(TaxLot.acquired_on, TaxLot.created_at)
-        .with_for_update()
+        for_update(
+            select(TaxLot)
+            .where(TaxLot.account_id == account.id, TaxLot.ticker == order.ticker)
+            .order_by(TaxLot.acquired_on, TaxLot.created_at)
+        )
     ).scalars())
 
     fee = q_money(Decimal(get_settings().trade_fee_usd))
@@ -917,10 +946,12 @@ def run_due_scheduled_orders(db: Session, now: datetime | None = None) -> int:
     from app.services.scenarios import frozen_accounts
 
     due = db.execute(
-        select(Order)
-        .where(Order.status == OrderStatus.SCHEDULED, Order.scheduled_for <= now,
-               Order.account_id.notin_(frozen_accounts(db)))
-        .with_for_update(skip_locked=True)
+        for_update(
+            select(Order)
+            .where(Order.status == OrderStatus.SCHEDULED, Order.scheduled_for <= now,
+                   Order.account_id.notin_(frozen_accounts(db))),
+            skip_locked=True,
+        )
     ).scalars().all()
     processed = 0
     for order in due:
@@ -975,10 +1006,12 @@ def run_pending_limit_orders(db: Session, now: datetime | None = None) -> int:
     from app.services.scenarios import frozen_accounts
 
     pending = db.execute(
-        select(Order)
-        .where(Order.status == OrderStatus.PENDING, Order.order_type == OrderType.LIMIT,
-               Order.account_id.notin_(frozen_accounts(db)))
-        .with_for_update(skip_locked=True)
+        for_update(
+            select(Order)
+            .where(Order.status == OrderStatus.PENDING, Order.order_type == OrderType.LIMIT,
+                   Order.account_id.notin_(frozen_accounts(db))),
+            skip_locked=True,
+        )
     ).scalars().all()
     filled = 0
     for order in pending:

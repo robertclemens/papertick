@@ -2,7 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-from fastapi import HTTPException, Response
+from fastapi import HTTPException, Request, Response
 
 from app.models import (
     Account,
@@ -19,6 +19,13 @@ from app import security
 from app.schemas import OrderCreateIn, ProfileUpdateIn, SignupIn
 from app.services import trading
 from app.models import OrderSource
+
+
+def _req(ip: str = "203.0.113.9", headers: dict | None = None) -> Request:
+    """Minimal ASGI scope for handlers that now resolve a client address."""
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": raw,
+                    "query_string": b"", "client": (ip, 12345)})
 
 
 @pytest.fixture()
@@ -44,13 +51,13 @@ def test_signup_requires_email_verification_in_production(db, prod_settings):
     assert user.email_verified is False
 
     with pytest.raises(HTTPException) as exc:
-        login(LoginIn(email="new.user@example.com", password="a-strong-pass-123"), Response(), db)
+        login(LoginIn(email="new.user@example.com", password="a-strong-pass-123"), _req(), Response(), db)
     assert exc.value.status_code == 403 and "not verified" in exc.value.detail
 
     token = security.make_email_verify_token(user.id)
     result = verify_email(EmailTokenIn(token=token), db)
     assert result["status"] == "verified"
-    out2 = login(LoginIn(email="new.user@example.com", password="a-strong-pass-123"), Response(), db)
+    out2 = login(LoginIn(email="new.user@example.com", password="a-strong-pass-123"), _req(), Response(), db)
     assert out2.tokens is not None
 
 
@@ -231,10 +238,14 @@ def test_passkey_auth_options(monkeypatch):
     assert opts.get("allowCredentials", []) == []  # discoverable / usernameless
     assert f"auth:{flow_id}" in store
 
-def test_password_login_asks_for_mfa_but_a_passkey_never_does(db, user, monkeypatch):
-    """The staged sign-in relies on this split: password + MFA is three steps,
-    a passkey is one. A passkey is already possession plus a biometric/PIN, so
-    adding a code on top would be a third factor, not a second."""
+def test_enrolled_mfa_is_required_on_both_sign_in_paths(db, user, monkeypatch):
+    """MFA the user turned on has to hold on every route into the account.
+
+    A passkey proves possession of a registered authenticator; it is not a
+    stand-in for the second factor the account is configured to demand. Letting
+    the passkey path issue a session outright would mean anyone who ever got a
+    passkey registered — a borrowed unlocked laptop, say — could sign straight
+    past the victim's own MFA, and a password change would not evict them."""
     from fastapi import Response
 
     from app.routers.auth import login
@@ -247,15 +258,58 @@ def test_password_login_asks_for_mfa_but_a_passkey_never_does(db, user, monkeypa
     user.mfa_enabled = True
     db.commit()
 
-    out = login(LoginIn(email=user.email, password="a-strong-pass-123"), Response(), db)
+    out = login(LoginIn(email=user.email, password="a-strong-pass-123"), _req(), Response(), db)
     assert out.mfa_required is True and out.mfa_token and out.tokens is None
 
     monkeypatch.setattr(passkeys, "verify_authentication", lambda db_, flow, cred: user)
     passkey_out = login_verify(
         PasskeyLoginVerifyIn(flow_id="flow", credential={}), Response(), db
     )
-    assert passkey_out.mfa_required is False
-    assert passkey_out.tokens is not None      # signed in outright
+    assert passkey_out.mfa_required is True
+    assert passkey_out.mfa_token and passkey_out.tokens is None
+
+    # without MFA enrolled the passkey remains a one-step sign-in
+    user.mfa_enabled = False
+    db.commit()
+    plain = login_verify(PasskeyLoginVerifyIn(flow_id="flow", credential={}), Response(), db)
+    assert plain.mfa_required is False and plain.tokens is not None
+
+
+def test_adding_a_passkey_needs_the_password_and_a_code(db, user, monkeypatch):
+    """A passkey outlives a password change, so enrolling one is a step-up."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    from app.deps import Principal
+    from app.routers.passkeys_router import register_options
+    from app.schemas import PasskeyRegisterStartIn
+    from app.services import passkeys
+
+    user.password_hash = security.hash_password("a-strong-pass-123")
+    secret = security.new_totp_secret()
+    user.mfa_secret_enc = security.seal_totp_secret(secret)
+    user.mfa_enabled = True
+    db.commit()
+    principal = Principal(user=user, scopes={"read", "trade", "manage"})
+    monkeypatch.setattr(passkeys, "registration_options", lambda db_, u: {"ok": True})
+
+    with _pytest.raises(HTTPException) as wrong_pw:
+        register_options(PasskeyRegisterStartIn(current_password="nope"), principal, db)
+    assert wrong_pw.value.status_code == 401
+
+    with _pytest.raises(HTTPException) as no_code:
+        register_options(
+            PasskeyRegisterStartIn(current_password="a-strong-pass-123"), principal, db
+        )
+    assert no_code.value.status_code == 422
+
+    import pyotp
+
+    assert register_options(
+        PasskeyRegisterStartIn(current_password="a-strong-pass-123",
+                               code=pyotp.TOTP(secret).now()),
+        principal, db,
+    ) == {"ok": True}
 
 
 # ---------------------------------------------------------------- password change

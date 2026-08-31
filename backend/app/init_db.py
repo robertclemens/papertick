@@ -183,6 +183,60 @@ def ensure_schema(engine) -> None:
                 log.info("schema: added %s.%s", table.name, col.name)
 
 
+def ensure_check_constraints(engine) -> None:
+    """Add the money-integrity CHECKs to a database created before them.
+
+    `create_all` only builds constraints for tables it creates, so an existing
+    deployment would otherwise keep running without the backstop. Rows that
+    already violate a constraint are repaired first — a NaN or negative balance
+    is corruption from the era before the locking fix, and leaving it in place
+    would only block the constraint from being added.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    # (table, column, also_reject_negative)
+    repairs = [
+        ("accounts", "settlement_balance", True),
+        ("accounts", "settlement_accrued", False),
+        ("positions", "shares", True),
+    ]
+    checks = [
+        ("accounts", "ck_account_settlement_balance_sane",
+         "settlement_balance >= 0 AND settlement_balance = settlement_balance"),
+        ("accounts", "ck_account_settlement_accrued_sane",
+         "settlement_accrued = settlement_accrued"),
+        ("positions", "ck_position_shares_sane", "shares >= 0 AND shares = shares"),
+    ]
+    # Table, column and constraint names below are literals defined a few lines
+    # up, never request data — the f-strings are DDL templating, not injection.
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table, column, reject_negative in repairs:
+            if not insp.has_table(table):
+                continue
+            bad = f"{column} <> {column}"          # true only for NaN
+            if reject_negative:
+                bad = f"{column} < 0 OR {bad}"
+            repair_sql = (
+                f"UPDATE {table} SET {column} = 0 "  # nosec B608 — literals, see above
+                f"WHERE {column} IS NOT NULL AND ({bad})"
+            )
+            fixed = conn.execute(text(repair_sql)).rowcount
+            if fixed:
+                log.warning("schema: reset %d non-finite/negative %s.%s value(s) to 0",
+                            fixed, table, column)
+        for table, name, expr in checks:
+            if not insp.has_table(table):
+                continue
+            conn.execute(text(
+                f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {name}"
+            ))
+            conn.execute(text(
+                f"ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({expr})"
+            ))
+            log.info("schema: constraint %s in place", name)
+
+
 def backfill_scenarios(db) -> None:
     """Everything that existed before scenarios belongs to the user's first one.
 
@@ -315,6 +369,7 @@ def main() -> None:
     ensure_enum_values(engine)
     ensure_schema(engine)
     Base.metadata.create_all(engine)
+    ensure_check_constraints(engine)
     seed()
     log.info("database ready")
 

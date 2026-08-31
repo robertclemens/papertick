@@ -16,6 +16,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.db import for_update
+
 from app.models import Account, Dividend, OrderSide, Transaction
 from app.services.market_data import MarketDataError, market_data
 
@@ -84,7 +86,7 @@ def reconcile_account_ticker(db: Session, account_id: str, ticker: str) -> Decim
 
     if net != 0:
         account = db.execute(
-            select(Account).where(Account.id == account_id).with_for_update()
+            for_update(select(Account).where(Account.id == account_id))
         ).scalar_one()
         account.settlement_balance = Decimal(account.settlement_balance) + net
         log.info("dividends reconciled %s/%s: %+.2f", account_id, ticker, net)

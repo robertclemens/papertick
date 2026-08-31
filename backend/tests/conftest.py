@@ -113,3 +113,44 @@ def limits(db):
             designation_deadline=date(year + 1, 4, 15),
         ))
     db.commit()
+
+
+class FakeRedis:
+    """In-memory stand-in for the rate-limit/lockout store.
+
+    Authentication now fails *closed* when this backend is unreachable (an
+    attacker must not be able to switch off brute-force protection by knocking
+    Redis over), so the auth tests need a working one rather than a refused
+    connection.
+    """
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    def get(self, k):
+        return self.store.get(k)
+
+    def set(self, k, v, ex=None):
+        self.store[k] = str(v)
+
+    def incr(self, k):
+        n = int(self.store.get(k, 0)) + 1
+        self.store[k] = str(n)
+        return n
+
+    def expire(self, k, seconds):
+        return True
+
+    def delete(self, *keys):
+        for k in keys:
+            self.store.pop(k, None)
+
+    def ping(self):
+        return True
+
+
+@pytest.fixture(autouse=True)
+def fake_redis(monkeypatch):
+    r = FakeRedis()
+    monkeypatch.setattr("app.rate_limit.get_redis", lambda: r)
+    return r

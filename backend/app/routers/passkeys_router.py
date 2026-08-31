@@ -6,19 +6,44 @@ from app.db import get_db
 from app.deps import Principal, require_manage
 from app.models import WebAuthnCredential
 from app.rate_limit import rate_limiter
-from app.schemas import LoginOut, PasskeyLoginVerifyIn, PasskeyOut, PasskeyRegisterVerifyIn
+from app.models import User
+from app.schemas import (
+    LoginOut,
+    PasskeyLoginVerifyIn,
+    PasskeyOut,
+    PasskeyRegisterStartIn,
+    PasskeyRegisterVerifyIn,
+)
+from app import security
 from app.services import passkeys
 
 router = APIRouter(prefix="/auth/passkeys", tags=["passkeys"])
 
 
+def _require_step_up(user: User, password: str, code: str | None) -> None:
+    """Re-prove the credentials before a change that outlives the session."""
+    if not security.verify_password(password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if user.mfa_enabled and user.mfa_secret_enc:
+        secret = security.open_totp_secret(user.mfa_secret_enc)
+        if secret is None or not security.verify_totp(secret, code or ""):
+            raise HTTPException(status_code=422, detail="Invalid authentication code")
+
+
 @router.post("/register/options")
-def register_options(principal: Principal = Depends(require_manage),
+def register_options(data: PasskeyRegisterStartIn,
+                     principal: Principal = Depends(require_manage),
                      db: Session = Depends(get_db)) -> dict:
     """Generates WebAuthn registration options for the signed-in user,
     excluding their existing passkeys so the same authenticator can't be
     re-registered. The challenge is stashed in Redis for 5 minutes and must
-    be redeemed by `/register/verify`."""
+    be redeemed by `/register/verify`.
+
+    Requires the current password (and a TOTP code, when enrolled): a passkey
+    is a permanent second way into the account that a password change does not
+    revoke, so adding one must not be something a merely-borrowed session can
+    do silently."""
+    _require_step_up(principal.user, data.current_password, data.code)
     return passkeys.registration_options(db, principal.user)
 
 
@@ -74,9 +99,16 @@ def login_verify(data: PasskeyLoginVerifyIn, response: Response,
                  db: Session = Depends(get_db)) -> LoginOut:
     """Completes passkey login: verifies the signed challenge against the
     stored public key and, on success, issues session tokens directly. There
-    is no separate MFA step here, since the passkey ceremony already proves
-    possession and (typically) device biometric/PIN verification."""
+    When the account also has TOTP enrolled, this returns an `mfa_token` for
+    `/auth/login/mfa` instead of session tokens — the same second step the
+    password path takes."""
     from app.routers.auth import _issue_tokens
 
     user = passkeys.verify_authentication(db, data.flow_id, data.credential)
+    if user.mfa_enabled:
+        # A passkey proves possession of a registered authenticator; it is not
+        # a substitute for a second factor the user deliberately turned on.
+        # Signing in straight past TOTP here would let anyone holding a
+        # registered passkey bypass the account's own MFA setting.
+        return LoginOut(mfa_required=True, mfa_token=security.make_mfa_token(user.id))
     return LoginOut(tokens=_issue_tokens(db, user, response))

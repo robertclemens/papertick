@@ -13,10 +13,31 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import Account, ApiKey, Scenario, User, utcnow
-from app.security import API_KEY_PREFIX, decode_token, hash_api_key
+from app.security import (
+    API_KEY_PREFIX,
+    access_token_revoked,
+    decode_token,
+    hash_api_key,
+)
 
-ACCESS_COOKIE = "pt_access"
-REFRESH_COOKIE = "pt_refresh"
+def _cookie_names() -> tuple[str, str]:
+    """Cookie names, prefixed when the deployment can honour the prefix rules.
+
+    `__Host-` pins a cookie to the exact origin: it requires Secure, forbids a
+    Domain attribute and forces Path=/, which closes the sibling-subdomain hole
+    SameSite leaves open (SameSite is scoped to the registrable domain, not the
+    origin). The refresh cookie keeps its narrower Path=/api/v1/auth, which
+    `__Host-` forbids, so it takes `__Secure-` instead. Over plain HTTP no
+    prefix is usable and the bare names are kept.
+    """
+    from app.config import get_settings
+
+    if get_settings().cookie_secure:
+        return "__Host-pt_access", "__Secure-pt_refresh"
+    return "pt_access", "pt_refresh"
+
+
+ACCESS_COOKIE, REFRESH_COOKIE = _cookie_names()
 
 SESSION_SCOPES = {"read", "trade", "manage"}
 VALID_KEY_SCOPES = {"read", "trade"}
@@ -121,6 +142,10 @@ def get_principal(
         raise HTTPException(status_code=401, detail="Not authenticated")
     payload = decode_token(token, "access")
     if payload is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    # Signing out and changing a password revoke the session's refresh token;
+    # without this the stateless access token stays usable until it expires.
+    if access_token_revoked(payload):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     user = db.get(User, payload["sub"])
     if user is None or not user.is_active:

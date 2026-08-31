@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
+from app.db import for_update, get_db
 from app.deps import Principal, owned_account, require_manage, require_read, require_trade
 from app.models import (
     Account,
@@ -157,12 +157,18 @@ def deposit(account_id: str, data: DepositIn, principal: Principal = Depends(req
     rejected outright."""
     account = owned_account(account_id, principal, db)
     kind = CashFlowKind(data.kind)
-    tax_year, warnings, irs_after = irs.validate_deposit(
-        db, principal.user, account, data.amount, data.tax_year, kind
-    )
+    # Every lock is taken *before* the limit is checked. The check and the
+    # INSERT that consumes the room have to be one atomic step: validating
+    # first and locking afterwards lets two concurrent deposits both observe
+    # room and both commit, blowing past the annual limit.
+    if account.account_type in irs.IRA_LIKE:
+        irs.lock_contribution_scope(db, principal.user, principal.scenario_id)
     locked = db.execute(
-        select(Account).where(Account.id == account.id).with_for_update()
+        for_update(select(Account).where(Account.id == account.id))
     ).scalar_one()
+    tax_year, warnings, irs_after = irs.validate_deposit(
+        db, principal.user, locked, data.amount, data.tax_year, kind
+    )
     locked.settlement_balance = Decimal(locked.settlement_balance) + data.amount
     contribution = Contribution(
         account_id=locked.id, tax_year=tax_year, amount=data.amount, kind=kind
@@ -190,7 +196,7 @@ def withdraw(account_id: str, data: WithdrawIn, principal: Principal = Depends(r
 
     account = owned_account(account_id, principal, db)
     locked = db.execute(
-        select(Account).where(Account.id == account.id).with_for_update()
+        for_update(select(Account).where(Account.id == account.id))
     ).scalar_one()
     balance = Decimal(locked.settlement_balance)
     # cash backing open orders or short-put collateral is not withdrawable

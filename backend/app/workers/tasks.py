@@ -9,7 +9,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from app.db import get_sessionmaker
+from app.db import for_update, get_sessionmaker
 from app.models import (
     Asset,
     AssetClass,
@@ -58,12 +58,14 @@ def run_recurring_investments() -> int:
     try:
         now = utcnow()
         rules = db.execute(
-            select(RecurringRule)
-            .where(RecurringRule.status == RuleStatus.ACTIVE,
-                   RecurringRule.next_run_at <= now,
-                   # a deleted scenario is frozen while it is recoverable
-                   RecurringRule.account_id.notin_(frozen_accounts(db)))
-            .with_for_update(skip_locked=True)
+            for_update(
+                select(RecurringRule)
+                .where(RecurringRule.status == RuleStatus.ACTIVE,
+                       RecurringRule.next_run_at <= now,
+                       # a deleted scenario is frozen while it is recoverable
+                       RecurringRule.account_id.notin_(frozen_accounts(db))),
+                skip_locked=True,
+            )
         ).scalars().all()
         for rule in rules:
             amount = Decimal(rule.amount)

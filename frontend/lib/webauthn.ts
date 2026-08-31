@@ -21,8 +21,18 @@ export function passkeysSupported(): boolean {
   return typeof window !== "undefined" && !!window.PublicKeyCredential;
 }
 
-export async function registerPasskey(nickname: string): Promise<void> {
-  const options: any = await api("/auth/passkeys/register/options", { method: "POST" });
+/** Adding a passkey re-proves the password (and a TOTP code when enrolled):
+ *  a passkey is a second permanent way into the account that a password change
+ *  does not revoke, so a merely-borrowed session must not be able to add one. */
+export async function registerPasskey(
+  nickname: string,
+  currentPassword: string,
+  code?: string
+): Promise<void> {
+  const options: any = await api("/auth/passkeys/register/options", {
+    method: "POST",
+    body: { current_password: currentPassword, code: code || undefined },
+  });
   options.challenge = b64uToBuf(options.challenge);
   options.user.id = b64uToBuf(options.user.id);
   options.excludeCredentials = (options.excludeCredentials ?? []).map((c: any) => ({
@@ -52,7 +62,15 @@ export async function registerPasskey(nickname: string): Promise<void> {
   });
 }
 
-export async function signInWithPasskey(): Promise<void> {
+export interface PasskeyLoginResult {
+  mfa_required: boolean;
+  mfa_token: string | null;
+}
+
+/** Resolves with `mfa_required` set when the account also has TOTP enrolled —
+ *  a passkey proves possession of a registered authenticator, not the second
+ *  factor the account was configured to demand. */
+export async function signInWithPasskey(): Promise<PasskeyLoginResult> {
   const { flow_id, options } = await api<{ flow_id: string; options: any }>(
     "/auth/passkeys/login/options",
     { method: "POST" }
@@ -65,7 +83,7 @@ export async function signInWithPasskey(): Promise<void> {
   const cred = (await navigator.credentials.get({ publicKey: options })) as PublicKeyCredential;
   if (!cred) throw new Error("Passkey sign-in was cancelled");
   const resp = cred.response as AuthenticatorAssertionResponse;
-  await api("/auth/passkeys/login/verify", {
+  return await api<PasskeyLoginResult>("/auth/passkeys/login/verify", {
     method: "POST",
     body: {
       flow_id,

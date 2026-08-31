@@ -1,7 +1,7 @@
 from datetime import date
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -53,7 +53,8 @@ def education() -> dict:
 
 
 @router.get("/expirations/{underlying}")
-def expirations(underlying: str, principal: Principal = Depends(require_read),
+def expirations(underlying: str = Path(min_length=1, max_length=12),
+                principal: Principal = Depends(require_read),
                 db: Session = Depends(get_db)) -> dict:
     """Listed expiration dates for an underlying: six weekly Fridays, six
     monthly third-Fridays, and the next two January LEAPS, each rolled back to
@@ -68,7 +69,8 @@ def expirations(underlying: str, principal: Principal = Depends(require_read),
 
 @router.get("/chain/{underlying}", response_model=ChainOut,
             dependencies=[Depends(rate_limiter("chain", 60, 60))])
-def get_chain(underlying: str, expiry: date, principal: Principal = Depends(require_read),
+def get_chain(expiry: date, underlying: str = Path(min_length=1, max_length=12),
+              principal: Principal = Depends(require_read),
               db: Session = Depends(get_db)) -> ChainOut:
     """Full option chain for an underlying at one expiration: bid/ask/mid,
     implied volatility, delta, theta, and ITM/OTM status for both the call and

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db import get_db
+from app.db import for_update, get_db
 from app.deps import Principal, owned_account, require_read, require_trade
 from app.models import Account, Order, OrderSource, OrderStatus, Transaction
 from app.rate_limit import rate_limiter
@@ -145,7 +145,7 @@ def cancel_order(order_id: str, principal: Principal = Depends(require_trade),
     returns a conflict — and cancelling releases whatever cash or shares it
     had committed."""
     order = db.execute(
-        select(Order).where(Order.id == order_id).with_for_update()
+        for_update(select(Order).where(Order.id == order_id))
     ).scalar_one_or_none()
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")

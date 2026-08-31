@@ -2,6 +2,7 @@ import logging
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
@@ -28,6 +29,12 @@ from app.services.market_data import MarketDataError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
+settings = get_settings()
+
+# Outside production the docs and spec stay open: they are how the API is
+# explored. In production they sit behind the same auth as everything else.
+_EXPOSE_DOCS_ANON = not settings.is_production
+
 app = FastAPI(
     title="PaperTick API",
     version="1.0.0",
@@ -46,11 +53,21 @@ app = FastAPI(
     # the stock docs pages are replaced by themed ones (app/docs_ui.py)
     docs_url=None,
     redoc_url=None,
-    openapi_url="/api/openapi.json",
+    # The spec is the full map of the attack surface — every route, bound and
+    # business rule. Agentic callers need it, anonymous ones do not, so in
+    # production it is served only to an authenticated caller (see docs_ui).
+    openapi_url="/api/openapi.json" if _EXPOSE_DOCS_ANON else None,
 )
 
-settings = get_settings()
-docs_ui.install(app, settings.frontend_origin)
+docs_ui.install(app, settings.frontend_origin, public=_EXPOSE_DOCS_ANON)
+
+# A request whose Host we do not recognise is rejected outright, so a spoofed
+# Host can never reach routing, a cache, or a generated URL.
+if settings.allowed_hosts.strip():
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=[h.strip() for h in settings.allowed_hosts.split(",") if h.strip()],
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,6 +77,63 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Scenario-Id"],
     expose_headers=["X-Scenario-Id", "X-Scenario-Name"],
 )
+
+
+# JSON API responses render nothing, so the policy can be maximally strict.
+# The docs pages set their own, looser policy (see app/docs_ui.py).
+API_CSP = (
+    "default-src \'none\'; frame-ancestors \'none\'; base-uri \'none\'; "
+    "form-action \'none\'; sandbox"
+)
+PERMISSIONS_POLICY = (
+    "camera=(), microphone=(), geolocation=(), payment=(), usb=(), "
+    "interest-cohort=()"
+)
+
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+MAX_BODY_BYTES = 8 * 1024 * 1024
+
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    """Refuse an oversized body before it is buffered and parsed.
+
+    Without this, an unauthenticated caller can make the server allocate and
+    deserialise an arbitrarily large document — and the scenario-import route
+    then instantiates a row object per element.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > MAX_BODY_BYTES:
+                return JSONResponse(status_code=413,
+                                    content={"detail": "Request body too large"})
+        except ValueError:
+            return JSONResponse(status_code=400,
+                                content={"detail": "Malformed Content-Length"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def csrf_origin_guard(request: Request, call_next):
+    """Reject cross-origin state-changing requests that ride on cookies.
+
+    SameSite=Lax already blocks the cross-site POST, but it is site-scoped
+    rather than origin-scoped and it is a browser-side control we do not get to
+    verify. This is the server-side half. API-key callers are exempt: they
+    carry an explicit credential rather than ambient cookie authority, which is
+    what CSRF abuses.
+    """
+    if request.method in UNSAFE_METHODS:
+        auth = request.headers.get("authorization", "")
+        is_bearer = auth.lower().startswith("bearer ")
+        origin = request.headers.get("origin")
+        if not is_bearer and origin and origin.rstrip("/") != settings.frontend_origin.rstrip("/"):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Cross-origin request rejected"},
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -76,8 +150,14 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
+    response.headers["Permissions-Policy"] = PERMISSIONS_POLICY
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    response.headers.setdefault("Content-Security-Policy", API_CSP)
     if settings.cookie_secure:
-        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=63072000; includeSubDomains; preload"
+        )
     return response
 
 

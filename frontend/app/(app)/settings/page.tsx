@@ -16,6 +16,14 @@ interface PasskeyT {
   last_used_at: string | null;
 }
 
+/** base64 for a data: URI, unicode-safe (btoa alone throws on non-Latin-1). */
+function qrDataUri(svg: string): string {
+  const bytes = new TextEncoder().encode(svg);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
 export default function SettingsPage() {
   // shared with the sidebar switcher, so a default change shows up there at once
   const { scenarios, refresh: refreshScenarios } = useScenarios();
@@ -51,7 +59,10 @@ export default function SettingsPage() {
   // passkeys
   const [pkDialog, setPkDialog] = useState(false);
   const [pkNickname, setPkNickname] = useState("");
+  const [pkPassword, setPkPassword] = useState("");
+  const [pkCode, setPkCode] = useState("");
   const [pkError, setPkError] = useState("");
+  const [mfaPassword, setMfaPassword] = useState("");
 
   const [busy, setBusy] = useState(false);
 
@@ -190,7 +201,9 @@ export default function SettingsPage() {
     setPkError("");
     setBusy(true);
     try {
-      await registerPasskey(pkNickname || "Passkey");
+      await registerPasskey(pkNickname || "Passkey", pkPassword, pkCode);
+      setPkPassword("");
+      setPkCode("");
       setPkDialog(false);
       setPkNickname("");
       setNotice("Passkey added — you can now sign in without a password.");
@@ -216,7 +229,11 @@ export default function SettingsPage() {
   async function startSetup() {
     setMfaError("");
     try {
-      setSetup(await api("/auth/mfa/setup", { method: "POST" }));
+      setSetup(await api("/auth/mfa/setup", {
+        method: "POST",
+        body: { current_password: mfaPassword },
+      }));
+      setMfaPassword("");
     } catch (err) {
       setMfaError(err instanceof ApiError ? err.message : "Failed to start MFA setup");
     }
@@ -417,12 +434,18 @@ export default function SettingsPage() {
         action={me.mfa_enabled ? <Badge value="ACTIVE" /> : undefined}
       >
         {!me.mfa_enabled && !setup && (
-          <div className="space-y-3">
+          <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); startSetup(); }}>
             <p className="text-sm text-slate-400">
               Optionally require a 6-digit code from an authenticator app when signing in with your password.
             </p>
-            <button className="btn-ghost" onClick={startSetup}>Set up authenticator</button>
-          </div>
+            <div>
+              <label className="label" htmlFor="mfa-pw">Confirm your password</label>
+              <input id="mfa-pw" type="password" required autoComplete="current-password"
+                     className="input max-w-xs" value={mfaPassword}
+                     onChange={(e) => setMfaPassword(e.target.value)} />
+            </div>
+            <button type="submit" className="btn-ghost">Set up authenticator</button>
+          </form>
         )}
         {setup && (
           <form onSubmit={enableMfa} className="space-y-4">
@@ -430,9 +453,13 @@ export default function SettingsPage() {
               Scan the QR code with your authenticator app, then enter the 6-digit code to confirm.
             </p>
             <div className="flex items-start gap-4">
-              <div className="shrink-0 overflow-hidden rounded-lg bg-white p-2"
-                   dangerouslySetInnerHTML={{ __html: setup.qr_svg }}
-                   aria-label="MFA enrollment QR code" />
+              {/* Rendered as an image, not injected as markup: an <img> with an
+                SVG source cannot run script, so this stays inert even if the
+                upstream generator ever changes. */}
+            <img className="shrink-0 rounded-lg bg-white p-2"
+                 width={160} height={160}
+                 src={`data:image/svg+xml;base64,${qrDataUri(setup.qr_svg)}`}
+                 alt="MFA enrollment QR code" />
               <div className="min-w-0 text-xs text-slate-400">
                 <div className="label">Manual entry secret</div>
                 <code className="break-all text-emerald-300">{setup.secret}</code>
@@ -582,6 +609,19 @@ export default function SettingsPage() {
             <input id="pk-name" maxLength={100} className="input" placeholder="e.g. Work laptop"
                    value={pkNickname} onChange={(e) => setPkNickname(e.target.value)} />
           </div>
+          <div>
+            <label className="label" htmlFor="pk-pw">Confirm your password</label>
+            <input id="pk-pw" type="password" required autoComplete="current-password"
+                   className="input" value={pkPassword}
+                   onChange={(e) => setPkPassword(e.target.value)} />
+          </div>
+          {me.mfa_enabled && (
+            <div>
+              <label className="label" htmlFor="pk-code">Authenticator code</label>
+              <input id="pk-code" inputMode="numeric" maxLength={8} required className="input"
+                     value={pkCode} onChange={(e) => setPkCode(e.target.value)} />
+            </div>
+          )}
           <ErrorText>{pkError}</ErrorText>
           <button type="submit" disabled={busy} className="btn-primary w-full">
             {busy ? "Follow your browser's prompt…" : "Create passkey"}

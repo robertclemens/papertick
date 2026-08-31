@@ -16,6 +16,17 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:3000"
     cookie_secure: bool = False
 
+    # Comma-separated CIDRs of reverse proxies whose X-Forwarded-For may be
+    # believed. Empty (the default) means trust nothing: the peer address is
+    # used, so a client cannot pick its own rate-limit bucket. Set this to the
+    # ingress/load-balancer range in any deployment that sits behind one.
+    trusted_proxy_cidrs: str = ""
+
+    # Comma-separated Host values this deployment answers to. Empty disables the
+    # check (fine for local development); set it in production so a spoofed Host
+    # cannot reach routing or a generated URL.
+    allowed_hosts: str = ""
+
     access_token_ttl_seconds: int = 60 * 15
     refresh_token_ttl_seconds: int = 60 * 60 * 24 * 7
     mfa_token_ttl_seconds: int = 60 * 5

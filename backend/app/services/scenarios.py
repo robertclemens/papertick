@@ -14,12 +14,13 @@ dividends and auto-invest rules are deliberately left behind. A scenario is
 
 import logging
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import security
 from app.models import (
     MAX_SCENARIOS_PER_USER,
     Account,
@@ -367,7 +368,7 @@ def export_scenario(db: Session, user: User, scenario: Scenario) -> dict:
             return []
         return list(db.execute(select(model).where(model.account_id.in_(ids))).scalars())
 
-    return {
+    body = {
         "format": "papertick.scenario",
         "version": EXPORT_VERSION,
         "exported_at": utcnow().isoformat(),
@@ -387,6 +388,9 @@ def export_scenario(db: Session, user: User, scenario: Scenario) -> dict:
         "option_positions": [_dump(p) for p in rows(OptionPosition)],
         "option_transactions": [_dump(t) for t in rows(OptionTransaction)],
     }
+    # Detached: the signature covers the body but is not part of it, so
+    # verification re-signs exactly what was signed.
+    return {**body, "signature": security.sign_export(body)}
 
 
 CHILD_TABLES = (
@@ -407,23 +411,103 @@ CHILD_TABLES = (
 CROSS_REFS = ("order_id", "recurring_rule_id", "exchange_from_order_id")
 
 
+# An import is signed (see `security.sign_export`), so a payload that reaches
+# the row loop was produced by this deployment. These bounds are the second
+# layer: they turn a corrupt or stale-but-signed file into a clean 422 instead
+# of a 500, a poisoned column, or an unbounded allocation.
+MAX_ROWS_PER_TABLE = 25_000
+MAX_ACCOUNTS = 100
+MAX_MAGNITUDE = Decimal("1e12")
+MIN_DATE = date(1900, 1, 1)
+MAX_DATE = date(2200, 1, 1)
+
+
+def _bad(field: str, why: str):
+    return HTTPException(status_code=422, detail=f"Invalid export: {field} {why}")
+
+
 def _revive(column, value):
-    """Turn an exported scalar back into what the column expects. JSON has no
-    date, decimal or enum types, so each comes back as text and is rebuilt from
-    the column definition rather than guessed at from the value."""
+    """Turn an exported scalar back into what the column expects, rejecting
+    anything the column cannot hold. JSON has no date, decimal or enum types,
+    so each comes back as text and is rebuilt from the column definition rather
+    than guessed at from the value."""
     if value is None:
         return None
     kind = column.type.__class__.__name__
-    if kind == "Numeric" and isinstance(value, str):
-        return Decimal(value)
-    if kind == "DateTime" and isinstance(value, str):
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    if kind == "Date" and isinstance(value, str):
-        return date.fromisoformat(value[:10])
+    name = column.name
+
+    if kind == "Numeric":
+        if isinstance(value, float):
+            raise _bad(name, "must be a decimal string, not a float")
+        try:
+            d = Decimal(value) if isinstance(value, (str, int)) else None
+        except (InvalidOperation, ValueError):
+            raise _bad(name, "is not a valid decimal")
+        if d is None:
+            raise _bad(name, "is not a valid decimal")
+        # NaN and Infinity are accepted by Decimal() and by PostgreSQL NUMERIC.
+        # Stored, they poison every later balance sum and turn the account list
+        # into a permanent 500.
+        if not d.is_finite():
+            raise _bad(name, "must be a finite number")
+        if abs(d) > MAX_MAGNITUDE:
+            raise _bad(name, f"exceeds the maximum magnitude of {MAX_MAGNITUDE:g}")
+        return d
+
+    if kind == "DateTime":
+        if not isinstance(value, str):
+            raise _bad(name, "must be an ISO-8601 timestamp")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise _bad(name, "is not a valid timestamp")
+        parsed = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        if not (MIN_DATE <= parsed.date() <= MAX_DATE):
+            raise _bad(name, "is outside the supported date range")
+        return parsed
+
+    if kind == "Date":
+        if not isinstance(value, str):
+            raise _bad(name, "must be an ISO-8601 date")
+        try:
+            parsed = date.fromisoformat(value[:10])
+        except ValueError:
+            raise _bad(name, "is not a valid date")
+        if not (MIN_DATE <= parsed <= MAX_DATE):
+            raise _bad(name, "is outside the supported date range")
+        return parsed
+
     enum_class = getattr(column.type, "enum_class", None)
-    if enum_class is not None and isinstance(value, str):
-        return enum_class(value)
+    if enum_class is not None:
+        if not isinstance(value, str):
+            raise _bad(name, "must be a string")
+        try:
+            return enum_class(value)
+        except ValueError:
+            raise _bad(name, f"is not one of {[e.value for e in enum_class]}")
+
+    if kind in ("String", "Text"):
+        if not isinstance(value, str):
+            raise _bad(name, "must be a string")
+        limit = getattr(column.type, "length", None)
+        if limit is not None and len(value) > limit:
+            raise _bad(name, f"is longer than {limit} characters")
+        if "\x00" in value:
+            raise _bad(name, "contains a NUL byte")
+        return value
+
+    if kind == "Integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _bad(name, "must be an integer")
+        if not (-2**31 < value < 2**31):
+            raise _bad(name, "is out of range")
+        return value
+
+    if kind == "Boolean":
+        if not isinstance(value, bool):
+            raise _bad(name, "must be true or false")
+        return value
+
     return value
 
 
@@ -450,6 +534,30 @@ def import_scenario(db: Session, user: User, payload: dict,
                    f"(expected {EXPORT_VERSION}).",
         )
 
+    # An import writes straight into the ledger: balances, contributions,
+    # realized gains, tax lots. Only a file this deployment produced may do
+    # that, so the signature is checked before a single row is read.
+    body = {k: v for k, v in payload.items() if k != "signature"}
+    if not security.verify_export(body, payload.get("signature")):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This file is not a valid PaperTick export: its signature is "
+                "missing or does not match. Import only files produced by this "
+                "deployment's scenario export, unmodified."
+            ),
+        )
+
+    if len(payload.get("accounts") or []) > MAX_ACCOUNTS:
+        raise HTTPException(status_code=422,
+                            detail=f"Export holds more than {MAX_ACCOUNTS} accounts")
+    for key, _model in CHILD_TABLES:
+        if len(payload.get(key) or []) > MAX_ROWS_PER_TABLE:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Export holds more than {MAX_ROWS_PER_TABLE:,} {key} rows",
+            )
+
     wanted = (name or (payload.get("scenario") or {}).get("name") or "Imported scenario").strip()
     if target_id:
         scenario = owned(db, user, target_id)
@@ -469,6 +577,8 @@ def import_scenario(db: Session, user: User, payload: dict,
     inserted: list[tuple[object, dict]] = []
 
     for account in payload.get("accounts") or []:
+        if not isinstance(account, dict):
+            raise HTTPException(status_code=422, detail="Invalid export: account row is not an object")
         old_id = account.get("id")
         data = _coerce(Account, account)
         data.pop("id", None)
@@ -482,6 +592,9 @@ def import_scenario(db: Session, user: User, payload: dict,
 
     for key, model in CHILD_TABLES:
         for payload_row in payload.get(key) or []:
+            if not isinstance(payload_row, dict):
+                raise HTTPException(status_code=422,
+                                    detail=f"Invalid export: {key} row is not an object")
             data = _coerce(model, payload_row)
             old_id = data.pop("id", None)
             mapped_account = id_map.get(data.get("account_id"))

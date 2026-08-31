@@ -1,7 +1,10 @@
 FROM node:24-alpine AS deps
 WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm install --no-audit --no-fund
+COPY package.json package-lock.json ./
+# `npm ci` installs exactly the lockfile, and fails if package.json and the
+# lockfile disagree. `npm install` would silently resolve new versions at build
+# time, so the image would not match what was reviewed.
+RUN npm ci --no-audit --no-fund
 
 FROM node:24-alpine AS builder
 WORKDIR /app

@@ -3,6 +3,7 @@ import uuid
 from datetime import date, datetime, timezone
 
 from sqlalchemy import (
+    CheckConstraint,
     Boolean,
     Date,
     DateTime,
@@ -271,6 +272,19 @@ MAX_SCENARIOS_PER_USER = 100
 
 class Account(Base):
     __tablename__ = "accounts"
+    __table_args__ = (
+        # The database is the last line of defence for money. A lost update or
+        # a bad import should fail loudly here rather than settle quietly into
+        # a negative or non-numeric balance that every later sum inherits.
+        # `x = x` is false for NaN, so this rejects NaN and Infinity too.
+        CheckConstraint("settlement_balance >= 0 AND settlement_balance = settlement_balance",
+                        name="ck_account_settlement_balance_sane"),
+        # Not `>= 0`: the monthly credit is rounded to the cent, so the
+        # remainder carried forward is legitimately a tiny negative fraction
+        # when it rounds up. Only non-finite values are wrong here.
+        CheckConstraint("settlement_accrued = settlement_accrued",
+                        name="ck_account_settlement_accrued_sane"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
@@ -331,7 +345,10 @@ class Asset(Base):
 
 class Position(Base):
     __tablename__ = "positions"
-    __table_args__ = (UniqueConstraint("account_id", "ticker", name="uq_position_account_ticker"),)
+    __table_args__ = (
+        UniqueConstraint("account_id", "ticker", name="uq_position_account_ticker"),
+        CheckConstraint("shares >= 0 AND shares = shares", name="ck_position_shares_sane"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)

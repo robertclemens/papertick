@@ -27,6 +27,8 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.db import for_update
+
 from app.config import get_settings
 from app.models import (
     Account,
@@ -275,7 +277,9 @@ def open_position(db: Session, account: Account, data: OptionOrderIn,
     fee = q_money(Decimal(get_settings().option_fee_per_contract) * data.contracts)
     c100 = Decimal(data.contracts) * HUNDRED
 
-    locked = db.execute(select(Account).where(Account.id == account.id).with_for_update()).scalar_one()
+    locked = db.execute(
+        for_update(select(Account).where(Account.id == account.id))
+    ).scalar_one()
     side = PositionSide.LONG if data.action == "BUY_TO_OPEN" else PositionSide.SHORT
     today = now.date()
 
@@ -347,14 +351,14 @@ def open_position(db: Session, account: Account, data: OptionOrderIn,
         action = OptionAction.SELL_TO_OPEN
 
     position = db.execute(
-        select(OptionPosition).where(
+        for_update(select(OptionPosition).where(
             OptionPosition.account_id == locked.id,
             OptionPosition.underlying == data.underlying,
             OptionPosition.right == data.right,
             OptionPosition.strike == data.strike,
             OptionPosition.expiry == data.expiry,
             OptionPosition.side == side,
-        ).with_for_update()
+        ))
     ).scalar_one_or_none()
     if position is None:
         position = OptionPosition(
@@ -397,7 +401,7 @@ def close_position(db: Session, position: OptionPosition, contracts: int,
     today = now.date()
 
     account = db.execute(
-        select(Account).where(Account.id == position.account_id).with_for_update()
+        for_update(select(Account).where(Account.id == position.account_id))
     ).scalar_one()
 
     if position.side == PositionSide.LONG:
@@ -476,7 +480,7 @@ def exercise(db: Session, position: OptionPosition, contracts: int,
     today = now.date()
 
     account = db.execute(
-        select(Account).where(Account.id == position.account_id).with_for_update()
+        for_update(select(Account).where(Account.id == position.account_id))
     ).scalar_one()
 
     if position.right == OptionRight.CALL:
@@ -546,11 +550,13 @@ def process_expirations(db: Session, now: datetime | None = None) -> int:
     from app.services.scenarios import frozen_accounts
 
     positions = db.execute(
-        select(OptionPosition)
-        .where(OptionPosition.expiry <= today,
-               # a deleted scenario is frozen until it is restored or purged
-               OptionPosition.account_id.notin_(frozen_accounts(db)))
-        .with_for_update(skip_locked=True)
+        for_update(
+            select(OptionPosition)
+            .where(OptionPosition.expiry <= today,
+                   # a deleted scenario is frozen until it is restored or purged
+                   OptionPosition.account_id.notin_(frozen_accounts(db))),
+            skip_locked=True,
+        )
     ).scalars().all()
     processed = 0
     for pos in positions:
@@ -578,7 +584,7 @@ def _settle_expired(db: Session, pos: OptionPosition, spot: Decimal) -> None:
     intrinsic = (spot - strike) if pos.right == OptionRight.CALL else (strike - spot)
 
     account = db.execute(
-        select(Account).where(Account.id == pos.account_id).with_for_update()
+        for_update(select(Account).where(Account.id == pos.account_id))
     ).scalar_one()
 
     def txn(action, *, cash=ZERO, realized=None, st=None, lt=None):

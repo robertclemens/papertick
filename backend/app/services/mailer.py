@@ -3,6 +3,7 @@ links) are written to the backend log instead — handy for development."""
 
 import logging
 import smtplib
+import ssl
 from email.message import EmailMessage
 
 from app.config import get_settings
@@ -13,7 +14,16 @@ log = logging.getLogger("papertick.mailer")
 def send_email(to: str, subject: str, body: str) -> bool:
     s = get_settings()
     if not s.smtp_host:
-        log.info("EMAIL (SMTP not configured) to=%s subject=%r\n%s", to, subject, body)
+        # The body carries a verification link, and that link is a 24-hour
+        # bearer credential that can verify an account or rewrite its sign-in
+        # address. Logging it hands account takeover to anyone who can read the
+        # container logs, so only metadata is recorded — and in production a
+        # missing relay is an error, not a fallback.
+        if s.is_production:
+            log.error("SMTP is not configured — could not deliver %r to %s", subject, to)
+        else:
+            log.info("EMAIL (dev, SMTP not configured) to=%s subject=%r "
+                     "[body withheld: contains an action token]", to, subject)
         return False
     msg = EmailMessage()
     msg["From"] = s.smtp_from
@@ -23,13 +33,18 @@ def send_email(to: str, subject: str, body: str) -> bool:
     try:
         with smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=10) as server:
             if s.smtp_starttls:
-                server.starttls()
+                # `starttls()` with no context uses ssl._create_stdlib_context(),
+                # which sets check_hostname=False and verify_mode=CERT_NONE — an
+                # encrypted channel to whoever answers. Anyone in path could
+                # otherwise read the SMTP password and every verification link.
+                server.starttls(context=ssl.create_default_context())
             if s.smtp_user:
                 server.login(s.smtp_user, s.smtp_password)
             server.send_message(msg)
         return True
-    except (smtplib.SMTPException, OSError) as exc:
-        log.error("failed to send email to %s: %s", to, exc)
+    except (smtplib.SMTPException, ssl.SSLError, OSError) as exc:
+        # Fail closed and stay quiet about the cause beyond the class of error.
+        log.error("failed to send email to %s: %s", to, exc.__class__.__name__)
         return False
 
 

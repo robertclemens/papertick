@@ -1,9 +1,14 @@
 """WebAuthn passkey support (registration + passwordless authentication).
 
-Uses py_webauthn for the full ceremony verification. Passkeys are registered
-as discoverable credentials (resident keys) with user verification preferred,
-so signing in needs no username and carries its own second factor
-(possession + device PIN/biometric). Challenges live in Redis for 5 minutes.
+Uses py_webauthn for the full ceremony verification. Passkeys are registered as
+discoverable credentials (resident keys) with user verification *required*, so
+signing in needs no username and genuinely carries its own second factor
+(possession + device PIN/biometric) rather than possession alone. Challenges
+live in Redis for 5 minutes.
+
+A passkey is still one credential, not two: when the account also has TOTP
+enrolled, the router asks for the code after the ceremony (see
+routers/passkeys_router.py).
 """
 
 import base64
@@ -76,7 +81,11 @@ def registration_options(db: Session, user: User) -> dict:
         user_display_name=user.email,
         authenticator_selection=AuthenticatorSelectionCriteria(
             resident_key=ResidentKeyRequirement.REQUIRED,
-            user_verification=UserVerificationRequirement.PREFERRED,
+            # REQUIRED, not PREFERRED: the passkey login path issues a full
+            # session on its own, so the ceremony has to actually carry the
+            # second factor (device PIN or biometric) rather than merely
+            # requesting one and accepting possession alone.
+            user_verification=UserVerificationRequirement.REQUIRED,
         ),
         exclude_credentials=[
             PublicKeyCredentialDescriptor(id=_from_b64u(c.credential_id)) for c in existing
@@ -118,7 +127,7 @@ def authentication_options() -> tuple[str, dict]:
     flow_id = secrets.token_urlsafe(24)
     opts = generate_authentication_options(
         rp_id=s.rp_id,
-        user_verification=UserVerificationRequirement.PREFERRED,
+        user_verification=UserVerificationRequirement.REQUIRED,
         allow_credentials=[],
     )
     _store_challenge(f"auth:{flow_id}", opts.challenge)
@@ -142,7 +151,10 @@ def verify_authentication(db: Session, flow_id: str, credential: dict) -> User:
             expected_origin=s.frontend_origin,
             credential_public_key=_from_b64u(row.public_key),
             credential_current_sign_count=row.sign_count,
-            require_user_verification=False,
+            # Enforced, not just requested: without this the flag the
+            # authenticator sets is never checked and a non-verifying
+            # authenticator signs in on possession alone.
+            require_user_verification=True,
         )
     except InvalidAuthenticationResponse as exc:
         raise HTTPException(status_code=401, detail=f"Passkey sign-in failed: {exc}")

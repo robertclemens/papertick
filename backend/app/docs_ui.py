@@ -13,7 +13,11 @@ explicit theme object built from the same palette.
 
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import HTMLResponse
+from pathlib import Path
+
+from fastapi import Depends
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 # frontend/app/globals.css
 BG = "#020617"        # slate-950, page
@@ -187,11 +191,11 @@ REDOC_HTML = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>__TITLE__</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
+<link rel="shortcut icon" href="data:,">
 <style>__CSS__</style>
 </head>
 <body>__BAR__<div id="redoc"></div>
-<script src="https://cdn.jsdelivr.net/npm/redoc@2.1.5/bundles/redoc.standalone.js"></script>
+<script src="__REDOC_JS__"></script>
 <script>
 if (!window.Redoc) {
   document.getElementById("redoc").innerHTML =
@@ -269,15 +273,60 @@ Redoc.init("__SPEC__", {
 """
 
 
-def install(app: FastAPI, app_url: str) -> None:
-    """Mount themed /api/docs and /api/redoc (app.docs_url must be None)."""
+STATIC_DIR = Path(__file__).parent / "static"
 
-    @app.get("/api/docs", include_in_schema=False)
+# Swagger UI and ReDoc are served from app/static rather than a CDN: an
+# unauthenticated page on the API's own origin must not execute third-party
+# JavaScript pinned to a floating version with no integrity hash. See
+# app/static/README.md.
+SWAGGER_JS = "/api/docs-assets/swagger-ui-bundle.js"
+SWAGGER_CSS_URL = "/api/docs-assets/swagger-ui.css"
+REDOC_JS = "/api/docs-assets/redoc.standalone.js"
+
+# The docs pages do render markup, so they cannot use the API's `default-src
+# 'none'` policy — but everything they load now comes from this origin.
+DOCS_CSP = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; "
+    "connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; "
+    "base-uri 'none'; form-action 'self'; object-src 'none'"
+)
+
+
+def _docs_response(body: str) -> HTMLResponse:
+    return HTMLResponse(body, headers={"Content-Security-Policy": DOCS_CSP})
+
+
+def install(app: FastAPI, app_url: str, public: bool = True) -> None:
+    """Mount themed /api/docs and /api/redoc (app.docs_url must be None).
+
+    `public=False` (production) puts the pages and the spec behind the same
+    read authorization as the rest of the API, so the full description of the
+    attack surface is not handed to anonymous callers.
+    """
+    from app.deps import require_read
+
+    guard: list = [] if public else [Depends(require_read)]
+
+    app.mount("/api/docs-assets", StaticFiles(directory=STATIC_DIR), name="docs-assets")
+
+    spec_url = "/api/openapi.json"
+    if not public:
+        @app.get(spec_url, include_in_schema=False, dependencies=guard)
+        def openapi_spec() -> JSONResponse:
+            return JSONResponse(app.openapi())
+
+    @app.get("/api/docs", include_in_schema=False, dependencies=guard)
     def swagger_ui() -> HTMLResponse:
         html = get_swagger_ui_html(
-            openapi_url=app.openapi_url,
+            openapi_url=app.openapi_url or spec_url,
             title=f"{app.title} — reference",
-            swagger_ui_parameters={"docExpansion": "none", "persistAuthorization": True},
+            swagger_js_url=SWAGGER_JS,
+            swagger_css_url=SWAGGER_CSS_URL,
+            # Off deliberately: persisting the credential writes any API key
+            # pasted into the Authorize dialog into localStorage on the API's
+            # own origin, where any script on the page can read it.
+            swagger_ui_parameters={"docExpansion": "none", "persistAuthorization": False},
         )
         body = html.body.decode()
         # Swagger UI 5's own dark theme; the sheet below only re-tints it
@@ -286,15 +335,16 @@ def install(app: FastAPI, app_url: str) -> None:
         body = body.replace(
             "<body>", f"<body>{_chrome(app_url, ('/api/redoc', 'ReDoc'))}", 1
         )
-        return HTMLResponse(body)
+        return _docs_response(body)
 
-    @app.get("/api/redoc", include_in_schema=False)
+    @app.get("/api/redoc", include_in_schema=False, dependencies=guard)
     def redoc_ui() -> HTMLResponse:
         html = REDOC_HTML
         for key, value in {
             "__TITLE__": f"{app.title} — reference",
-            "__SPEC__": app.openapi_url or "/api/openapi.json",
+            "__SPEC__": app.openapi_url or spec_url,
             "__CSS__": REDOC_CSS,
+            "__REDOC_JS__": REDOC_JS,
             "__BAR__": _chrome(app_url, ("/api/docs", "Swagger UI")),
             "__BG__": BG, "__CARD__": CARD, "__BORDER__": BORDER, "__TEXT__": TEXT,
             "__MUTED__": MUTED, "__ACCENT__": ACCENT, "__CODE__": CODE, "__TYPE__": TYPE,
@@ -302,4 +352,4 @@ def install(app: FastAPI, app_url: str) -> None:
             "__FONT__": FONT, "__MONO__": MONO,
         }.items():
             html = html.replace(key, value)
-        return HTMLResponse(html)
+        return _docs_response(html)

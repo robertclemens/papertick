@@ -8,6 +8,8 @@ mutable buffers (CPython cannot guarantee immutable str cleanup — documented l
 import base64
 import hashlib
 import hmac
+import json
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +22,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from app.config import get_settings
+
+log = logging.getLogger("papertick.security")
 
 # Argon2id, tuned above library defaults (64 MiB memory hard).
 _ph = PasswordHasher(time_cost=3, memory_cost=64 * 1024, parallelism=2, hash_len=32, salt_len=16)
@@ -150,18 +154,24 @@ def constant_time_eq(a: str, b: str) -> bool:
 
 # ---------------------------------------------------------------- TOTP (secret sealed at rest)
 
+def _derive_key(salt: bytes, info: bytes) -> bytearray:
+    """A 32-byte subkey of SECRET_KEY, domain-separated by (salt, info).
+
+    Returned as a bytearray so the caller can zero it after use — `wipe()` on a
+    `bytes` copy would zero the copy and leave the original in memory.
+    """
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info)
+    return bytearray(hkdf.derive(get_settings().secret_key.encode()))
+
+
 def _fernet() -> Fernet:
-    hkdf = HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=b"papertick.totp.v1",
-        info=b"totp-secret-encryption",
-    )
-    key = hkdf.derive(get_settings().secret_key.encode())
-    fkey = base64.urlsafe_b64encode(key)
-    f = Fernet(fkey)
-    wipe(bytearray(key))
-    return f
+    key = _derive_key(b"papertick.totp.v1", b"totp-secret-encryption")
+    fkey = base64.urlsafe_b64encode(bytes(key))
+    try:
+        return Fernet(fkey)
+    finally:
+        wipe(key)
+        wipe(bytearray(fkey))
 
 
 def new_totp_secret() -> str:
@@ -187,3 +197,97 @@ def verify_totp(secret: str, code: str) -> bool:
     if not code or not code.strip().isdigit():
         return False
     return pyotp.TOTP(secret).verify(code.strip(), valid_window=1)
+
+
+# ---------------------------------------------------------------- export signing
+
+def _canonical(payload: dict) -> bytes:
+    """Stable byte rendering of an export body, so a signature does not depend
+    on key order or whitespace."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      default=str).encode("utf-8")
+
+
+def sign_export(payload: dict) -> str:
+    """Detached HMAC-SHA256 over an export body.
+
+    Scenario import writes straight into the ledger — balances, contributions,
+    realized gains and tax lots. Without a signature the endpoint is an
+    arbitrary-state-injection primitive: a hand-written file can mint any
+    balance and bypass every contribution limit. Signing makes the export a
+    restore artefact rather than an authoring format; a genuine export
+    round-trips untouched, an edited one does not verify.
+    """
+    key = _derive_key(b"papertick.export.v1", b"scenario-export-signing")
+    try:
+        return hmac.new(bytes(key), _canonical(payload), hashlib.sha256).hexdigest()
+    finally:
+        wipe(key)
+
+
+def verify_export(payload: dict, signature: str | None) -> bool:
+    if not signature or not isinstance(signature, str):
+        return False
+    return hmac.compare_digest(sign_export(payload), signature)
+
+
+# ---------------------------------------------------------------- access-token revocation
+
+def _revoked_key(jti: str) -> str:
+    return f"revoked:jti:{jti}"
+
+
+def revoke_access_token(token: str) -> None:
+    """Deny a still-valid access JWT for the rest of its lifetime.
+
+    Access tokens are stateless, so signing out or changing a password
+    otherwise leaves a stolen one working until it expires — "sign out
+    everywhere" that does not. The entry expires with the token, so the
+    denylist stays small.
+    """
+    from app.rate_limit import get_redis
+
+    payload = decode_token(token, "access")
+    if payload is None:
+        return
+    ttl = int(payload["exp"] - datetime.now(timezone.utc).timestamp())
+    if ttl <= 0:
+        return
+    try:
+        get_redis().set(_revoked_key(payload["jti"]), "1", ex=ttl)
+    except Exception as exc:  # noqa: BLE001 — a store outage must not break sign-out
+        log.error("could not record token revocation: %s", exc.__class__.__name__)
+
+
+def revoke_all_access_tokens(user_id: str) -> None:
+    """Deny every access token issued to `user_id` before now.
+
+    Individual jtis are not enumerable, so this records a cutoff instead: any
+    token issued at or before this instant is refused. Kept for the maximum
+    lifetime of an access token, after which nothing older can still be valid.
+    """
+    from app.rate_limit import get_redis
+
+    ttl = get_settings().access_token_ttl_seconds + 60
+    try:
+        get_redis().set(f"revoked:before:{user_id}",
+                        str(datetime.now(timezone.utc).timestamp()), ex=ttl)
+    except Exception as exc:  # noqa: BLE001
+        log.error("could not record session cutoff for %s: %s", user_id, exc.__class__.__name__)
+
+
+def access_token_revoked(payload: dict) -> bool:
+    from app.rate_limit import get_redis
+
+    try:
+        r = get_redis()
+        if r.get(_revoked_key(payload.get("jti", ""))):
+            return True
+        cutoff = r.get(f"revoked:before:{payload.get('sub', '')}")
+        return cutoff is not None and float(payload.get("iat", 0)) <= float(cutoff)
+    except Exception as exc:  # noqa: BLE001
+        # Fail open: the token is still signed, unexpired and issued by us.
+        # Refusing every request when the denylist is unreachable would turn a
+        # cache outage into a total sign-out.
+        log.error("revocation check unavailable: %s", exc.__class__.__name__)
+        return False

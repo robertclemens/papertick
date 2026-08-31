@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.db import for_update
 from app.models import (
     IRA_TYPES,
     Account,
@@ -82,6 +83,27 @@ def contributed_for_year(db: Session, user: User, tax_year: int,
     if scenario_id:
         q = q.where(Account.scenario_id == scenario_id)
     return Decimal(db.execute(q).scalar_one())
+
+
+def lock_contribution_scope(db: Session, user: User, scenario_id: str | None) -> None:
+    """Serialise the shared annual IRA limit for one user (and scenario).
+
+    The limit is shared across all of a user's IRAs, so locking only the account
+    being deposited into is not enough: two deposits into two *different* IRAs
+    both read "room available" and both commit. Locking the whole set makes the
+    check-then-insert a single atomic step.
+
+    Rows are locked in a deterministic order (by id) so two callers can never
+    take the same pair in opposite orders and deadlock.
+    """
+    q = (
+        select(Account)
+        .where(Account.user_id == user.id, Account.account_type.in_(IRA_LIKE))
+        .order_by(Account.id)
+    )
+    if scenario_id:
+        q = q.where(Account.scenario_id == scenario_id)
+    db.execute(for_update(q)).scalars().all()
 
 
 def contributed_by_account(db: Session, account_id: str, tax_year: int) -> Decimal:

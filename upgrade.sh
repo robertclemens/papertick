@@ -62,11 +62,14 @@ fi
 sep
 
 # ── Snapshot current versions ──────────────────────────────
-step "Current versions"
-echo "  Python    $("$VENV/bin/python" --version 2>/dev/null || echo 'venv not found')"
-echo "  Node      $(node --version 2>/dev/null || echo 'not found')"
-echo "  npm       $(npm --version 2>/dev/null || echo 'not found')"
-echo "  Docker    $(docker --version 2>/dev/null || echo 'not found')"
+# This machine's tooling only -- used to run the test gate locally, not what
+# the app runs on. The pinned, deployed versions (Dockerfile/docker-compose.yml)
+# are in the "Docker base images" report below.
+step "This machine's tooling (used to run the test gate, not what's deployed)"
+echo "  venv python  $("$VENV/bin/python" --version 2>/dev/null || echo 'venv not found')"
+echo "  host node    $(node --version 2>/dev/null || echo 'not found')"
+echo "  host npm     $(npm --version 2>/dev/null || echo 'not found')"
+echo "  Docker       $(docker --version 2>/dev/null || echo 'not found')"
 
 # ── Comprehensive dependency report — every direct package + every base
 # image, current vs. latest, regardless of mode (not just what's outdated,
@@ -387,9 +390,17 @@ rollback() {
 # ── Version summary ────────────────────────────────────────
 version_summary() {
   step "Post-upgrade versions"
-  echo "  Python    $("$VENV/bin/python" --version 2>/dev/null)"
-  echo "  Node      $(node --version 2>/dev/null)"
-  echo "  npm       $(npm --version 2>/dev/null)"
+  echo "  Running in the rebuilt containers (this is what your app actually runs on):"
+  echo "    backend    $(docker compose exec -T backend python --version 2>/dev/null || echo 'container not reachable')"
+  echo "    frontend   $(docker compose exec -T frontend node --version 2>/dev/null || echo 'container not reachable')"
+  echo ""
+  echo "  Local test tooling (backend/.venv and this shell's node/npm -- used to run"
+  echo "  pytest/tsc/build quickly without Docker; NOT what's deployed, and never"
+  echo "  upgraded by this script -- they just need to be recent enough to run the"
+  echo "  test gate, whatever Python/Node happen to be installed on this machine):"
+  echo "    venv python  $("$VENV/bin/python" --version 2>/dev/null)"
+  echo "    host node    $(node --version 2>/dev/null)"
+  echo "    host npm     $(npm --version 2>/dev/null)"
   echo ""
   echo "  Backend top-level packages:"
   "$VENV/bin/pip" list --format=freeze 2>/dev/null | grep -v -- '-e ' | head -30

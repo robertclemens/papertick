@@ -331,7 +331,7 @@ export default function TradePage() {
                   <p className="mt-1 text-xs text-slate-500">
                     {held.name} · gains{" "}
                     <span className={parseFloat(held.unrealized_gains) >= 0
-                      ? "text-[--status-good]" : "text-[--status-critical]"}>
+                      ? "text-(--status-good)" : "text-(--status-critical)"}>
                       {money(held.unrealized_gains)}
                     </span>
                   </p>
@@ -464,7 +464,7 @@ export default function TradePage() {
                               <span className="w-24 tabular-nums text-slate-400">{fmtShares(l.shares_open)} sh</span>
                               <span className="w-20 tabular-nums text-slate-400">@{money(l.cost_per_share)}</span>
                               <span className={`w-12 ${l.term === "LONG" ? "text-emerald-400" : "text-amber-400"}`}>{l.term}</span>
-                              <span className={`w-20 tabular-nums ${parseFloat(l.unrealized_gains ?? "0") >= 0 ? "text-[--status-good]" : "text-[--status-critical]"}`}>
+                              <span className={`w-20 tabular-nums ${parseFloat(l.unrealized_gains ?? "0") >= 0 ? "text-(--status-good)" : "text-(--status-critical)"}`}>
                                 {l.unrealized_gains ? money(l.unrealized_gains) : "—"}
                               </span>
                               <input aria-label={`Shares from lot acquired ${l.acquired_on}`} type="number"
@@ -525,7 +525,7 @@ A resting buy order earmarks its money in the settlement fund until it fills, is
                   <span className="text-3xl font-semibold tabular-nums">{money(quote.price)}</span>
                   {quote.change_pct !== null && (
                     <span className={`inline-flex items-center gap-1 text-sm font-medium ${
-                      quote.change_pct >= 0 ? "text-[--status-good]" : "text-[--status-critical]"
+                      quote.change_pct >= 0 ? "text-(--status-good)" : "text-(--status-critical)"
                     }`}>
                       <span aria-hidden>{quote.change_pct >= 0 ? "▲" : "▼"}</span>
                       {pct(quote.change_pct)}
@@ -598,7 +598,7 @@ A resting buy order earmarks its money in the settlement fund until it fills, is
                       <div className="flex justify-between">
                         <span className="text-slate-400">Realized gains</span>
                         <span className={parseFloat(result.transaction.realized_gains) >= 0
-                          ? "text-[--status-good]" : "text-[--status-critical]"}>
+                          ? "text-(--status-good)" : "text-(--status-critical)"}>
                           {money(result.transaction.realized_gains)}
                         </span>
                       </div>

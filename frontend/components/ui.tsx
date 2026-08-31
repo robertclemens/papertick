@@ -31,8 +31,8 @@ export function Stat({ label, value, delta, deltaGood }: {
             deltaGood === null || deltaGood === undefined
               ? "text-slate-400"
               : deltaGood
-                ? "text-[--status-good]"
-                : "text-[--status-critical]"
+                ? "text-(--status-good)"
+                : "text-(--status-critical)"
           }`}
         >
           {deltaGood !== null && deltaGood !== undefined && (

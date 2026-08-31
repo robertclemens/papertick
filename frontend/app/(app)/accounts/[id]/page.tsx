@@ -291,7 +291,7 @@ export default function AccountDetailPage() {
                       <td>{money(p.average_cost)}</td>
                       <td>{money(p.price)}</td>
                       <td>{money(p.market_value)}</td>
-                      <td className={u >= 0 ? "text-[--status-good]" : "text-[--status-critical]"}>
+                      <td className={u >= 0 ? "text-(--status-good)" : "text-(--status-critical)"}>
                         {signedMoney(p.unrealized_gains)} <span className="text-xs">({pct(p.unrealized_gains_pct)})</span>
                       </td>
                     </tr>
@@ -383,7 +383,7 @@ export default function AccountDetailPage() {
                       {c.memo && <div className="mt-0.5 text-xs text-slate-500">{c.memo}</div>}
                     </td>
                     <td>{c.tax_year ?? "—"}</td>
-                    <td className={parseFloat(c.amount) >= 0 ? "text-[--status-good]" : "text-[--status-critical]"}>
+                    <td className={parseFloat(c.amount) >= 0 ? "text-(--status-good)" : "text-(--status-critical)"}>
                       {signedMoney(c.amount)}
                     </td>
                   </tr>

@@ -210,7 +210,7 @@ export default function HistoryPage() {
                       <td className="font-medium">{d.ticker}</td>
                       <td>{money(d.per_share, 4)}</td>
                       <td>{shares(d.shares)}</td>
-                      <td className="text-[--status-good]">{signedMoney(d.amount)}</td>
+                      <td className="text-(--status-good)">{signedMoney(d.amount)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -246,7 +246,7 @@ export default function HistoryPage() {
                       <td>{money(t.fees)}</td>
                       <td className={
                         t.realized_gains == null ? "text-slate-500"
-                        : parseFloat(t.realized_gains) >= 0 ? "text-[--status-good]" : "text-[--status-critical]"
+                        : parseFloat(t.realized_gains) >= 0 ? "text-(--status-good)" : "text-(--status-critical)"
                       }>
                         {t.realized_gains == null ? "—" : signedMoney(t.realized_gains)}
                       </td>

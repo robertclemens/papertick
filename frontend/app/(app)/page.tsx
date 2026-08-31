@@ -25,7 +25,7 @@ import { useRangePref } from "@/lib/prefs";
 
 function gainClass(v: string | number | null | undefined): string {
   const n = typeof v === "string" ? parseFloat(v) : (v ?? 0);
-  return n >= 0 ? "text-[--status-good]" : "text-[--status-critical]";
+  return n >= 0 ? "text-(--status-good)" : "text-(--status-critical)";
 }
 
 const ALLOC_VIEWS: { key: AllocationGroupBy; label: string }[] = [
@@ -199,7 +199,7 @@ export default function DashboardPage() {
                       Rate of return{perf.rate_of_return_annualized && " (annualized)"}
                     </div>
                     <div className={`mt-0.5 text-xl font-semibold tabular-nums ${
-                      (perf.rate_of_return_pct ?? 0) >= 0 ? "text-[--status-good]" : "text-[--status-critical]"
+                      (perf.rate_of_return_pct ?? 0) >= 0 ? "text-(--status-good)" : "text-(--status-critical)"
                     }`}>
                       {pct(perf.rate_of_return_pct)}
                     </div>
@@ -232,13 +232,13 @@ export default function DashboardPage() {
                   <div>
                     <span className="text-slate-400">Time-weighted return </span>
                     <span className={`font-medium ${
-                      (perf.twr_pct ?? 0) >= 0 ? "text-[--status-good]" : "text-[--status-critical]"
+                      (perf.twr_pct ?? 0) >= 0 ? "text-(--status-good)" : "text-(--status-critical)"
                     }`}>{pct(perf.twr_pct)}</span>
                   </div>
                   <div>
                     <span className="text-slate-400">IRR (annualized) </span>
                     <span className={`font-medium ${
-                      (perf.irr_pct ?? 0) >= 0 ? "text-[--status-good]" : "text-[--status-critical]"
+                      (perf.irr_pct ?? 0) >= 0 ? "text-(--status-good)" : "text-(--status-critical)"
                     }`}>{pct(perf.irr_pct)}</span>
                   </div>
                   <div>
@@ -320,7 +320,7 @@ export default function DashboardPage() {
                           <td>{money(h.average_cost)}</td>
                           <td>{money(h.price)}</td>
                           <td>{money(h.market_value)}</td>
-                          <td className={h.unrealized_gains >= 0 ? "text-[--status-good]" : "text-[--status-critical]"}>
+                          <td className={h.unrealized_gains >= 0 ? "text-(--status-good)" : "text-(--status-critical)"}>
                             {signedMoney(h.unrealized_gains)}{" "}
                             <span className="text-xs">({pct(h.unrealized_gains_pct)})</span>
                           </td>
@@ -376,7 +376,7 @@ export default function DashboardPage() {
                                   </dt>
                                   <dd className={`tabular-nums ${
                                     (r.rate_of_return_pct ?? 0) >= 0
-                                      ? "text-[--status-good]" : "text-[--status-critical]"
+                                      ? "text-(--status-good)" : "text-(--status-critical)"
                                   }`}>{pct(r.rate_of_return_pct)}</dd>
                                 </div>
                               </dl>
@@ -466,7 +466,7 @@ export default function DashboardPage() {
                         <td>{money(t.gross_amount)}</td>
                         <td className={
                           t.realized_gains == null ? "text-slate-500"
-                          : parseFloat(t.realized_gains) >= 0 ? "text-[--status-good]" : "text-[--status-critical]"
+                          : parseFloat(t.realized_gains) >= 0 ? "text-(--status-good)" : "text-(--status-critical)"
                         }>
                           {t.realized_gains == null ? "—" : signedMoney(t.realized_gains)}
                         </td>

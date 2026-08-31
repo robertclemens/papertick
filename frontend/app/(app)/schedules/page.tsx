@@ -224,7 +224,7 @@ export default function SchedulesPage() {
                     <td>{dateTime(s.last_run_at)}</td>
                     <td><Badge value={s.status} /></td>
                     <td>{s.failure_count > 0 ? (
-                      <span className="text-[--status-critical]">{s.failure_count}</span>
+                      <span className="text-(--status-critical)">{s.failure_count}</span>
                     ) : "0"}</td>
                     <td className="text-right">
                       {s.status !== "CANCELLED" && (

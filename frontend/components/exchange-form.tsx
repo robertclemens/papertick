@@ -157,7 +157,7 @@ export default function ExchangeForm({ accounts, onExecuted }: {
                 <p className="mt-1 text-xs text-slate-500">
                   {held.name} · holding {money(held.market_value)}, gains{" "}
                   <span className={parseFloat(held.unrealized_gains) >= 0
-                    ? "text-[--status-good]" : "text-[--status-critical]"}>
+                    ? "text-(--status-good)" : "text-(--status-critical)"}>
                     {money(held.unrealized_gains)}
                   </span>
                 </p>
@@ -172,7 +172,7 @@ export default function ExchangeForm({ accounts, onExecuted }: {
                 placeholder="VTSAX, VOO, “vanguard 500”…"
               />
               {toTicker && toTicker === fromTicker && (
-                <p className="mt-1 text-xs text-[--status-critical]">
+                <p className="mt-1 text-xs text-(--status-critical)">
                   Pick a different fund to exchange into.
                 </p>
               )}
@@ -274,7 +274,7 @@ export default function ExchangeForm({ accounts, onExecuted }: {
                   <div className="flex justify-between gap-3 border-t border-slate-800 pt-1.5 font-medium">
                     <span className="text-slate-300">Taxable gains</span>
                     <span className={`tabular-nums ${parseFloat(preview.total_gains) >= 0
-                      ? "text-[--status-good]" : "text-[--status-critical]"}`}>
+                      ? "text-(--status-good)" : "text-(--status-critical)"}`}>
                       {money(preview.total_gains)}
                     </span>
                   </div>
@@ -304,7 +304,7 @@ export default function ExchangeForm({ accounts, onExecuted }: {
                           <td>{fmtShares(l.shares)}</td>
                           <td>{money(l.cost_per_share)}</td>
                           <td className={parseFloat(l.gain) >= 0
-                            ? "text-[--status-good]" : "text-[--status-critical]"}>
+                            ? "text-(--status-good)" : "text-(--status-critical)"}>
                             {money(l.gain)}
                           </td>
                           <td className={l.term === "LONG" ? "text-emerald-400" : "text-amber-400"}>
@@ -377,7 +377,7 @@ function Row({ label, value, tone }: { label: string; value: string; tone?: numb
       <span className="text-slate-400">{label}</span>
       <span className={`tabular-nums ${
         tone === undefined ? "text-slate-200"
-          : tone >= 0 ? "text-[--status-good]" : "text-[--status-critical]"
+          : tone >= 0 ? "text-(--status-good)" : "text-(--status-critical)"
       }`}>{value}</span>
     </div>
   );

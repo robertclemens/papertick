@@ -47,7 +47,7 @@ export default function TaxesPage() {
           {hint && <div className="text-xs text-slate-500">{hint}</div>}
         </div>
         <div className={`text-sm font-medium tabular-nums ${
-          !colored || n === 0 ? "text-slate-100" : n > 0 ? "text-[--status-good]" : "text-[--status-critical]"
+          !colored || n === 0 ? "text-slate-100" : n > 0 ? "text-(--status-good)" : "text-(--status-critical)"
         }`}>
           {money(value)}
         </div>
@@ -94,7 +94,7 @@ export default function TaxesPage() {
             <div className="flex items-baseline justify-between pt-3">
               <div className="text-sm font-semibold text-slate-100">Total realized gains</div>
               <div className={`text-base font-semibold tabular-nums ${
-                totalGains === 0 ? "text-slate-100" : totalGains > 0 ? "text-[--status-good]" : "text-[--status-critical]"
+                totalGains === 0 ? "text-slate-100" : totalGains > 0 ? "text-(--status-good)" : "text-(--status-critical)"
               }`}>
                 {money(totalGains)}
               </div>

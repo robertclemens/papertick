@@ -137,14 +137,14 @@ export default function AccountsPage() {
             <div className="text-xs text-slate-400">Investment returns</div>
             <div className={`text-xl font-semibold tabular-nums ${
               parseFloat(returns.total_investment_returns) >= 0
-                ? "text-[--status-good]" : "text-[--status-critical]"
+                ? "text-(--status-good)" : "text-(--status-critical)"
             }`}>{signedMoney(returns.total_investment_returns)}</div>
           </div>
           <div>
             <div className="text-xs text-slate-400">Rate of return</div>
             <div className={`text-xl font-semibold tabular-nums ${
               (returns.total_rate_of_return_pct ?? 0) >= 0
-                ? "text-[--status-good]" : "text-[--status-critical]"
+                ? "text-(--status-good)" : "text-(--status-critical)"
             }`}>{pct(returns.total_rate_of_return_pct)}</div>
           </div>
           <div className="ml-auto text-xs text-slate-500">
@@ -246,7 +246,7 @@ export default function AccountsPage() {
                             <div className="text-xs text-slate-400">Investment returns</div>
                             <div className={`text-2xl font-semibold tabular-nums ${
                               parseFloat(r?.investment_returns ?? "0") >= 0
-                                ? "text-[--status-good]" : "text-[--status-critical]"
+                                ? "text-(--status-good)" : "text-(--status-critical)"
                             }`}>{r ? signedMoney(r.investment_returns) : "—"}</div>
                           </div>
                           <div>
@@ -255,7 +255,7 @@ export default function AccountsPage() {
                             </div>
                             <div className={`text-2xl font-semibold tabular-nums ${
                               (r?.rate_of_return_pct ?? 0) >= 0
-                                ? "text-[--status-good]" : "text-[--status-critical]"
+                                ? "text-(--status-good)" : "text-(--status-critical)"
                             }`}>{r ? pct(r.rate_of_return_pct) : "—"}</div>
                           </div>
                           <div>

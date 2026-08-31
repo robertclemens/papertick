@@ -311,7 +311,7 @@ export default function OptionsPage() {
                       <td>{money(v.position.avg_premium)}</td>
                       <td>{money(v.mark)}</td>
                       <td>{money(v.market_value)}</td>
-                      <td className={u >= 0 ? "text-[--status-good]" : "text-[--status-critical]"}>
+                      <td className={u >= 0 ? "text-(--status-good)" : "text-(--status-critical)"}>
                         {money(v.unrealized_gains)}
                       </td>
                       <td>{v.days_to_expiry}d</td>

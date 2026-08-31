@@ -38,13 +38,15 @@ x-backend-env: &backend-env
 
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: papertick
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: papertick
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # postgres 18+'s official image mounts at the parent dir (not .../data) so it
+      # can lay out major-version-specific subdirectories for pg_ctlcluster/pg_upgrade.
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U papertick -d papertick"]
       interval: 5s
@@ -53,7 +55,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
       - redisdata:/data
@@ -115,5 +117,11 @@ services:
     restart: unless-stopped
 
 volumes:
+  # Named explicitly (and distinctly from the pre-upgrade "papertick_pgdata") because
+  # Postgres data directories aren't binary-compatible across major versions — this
+  # gives the new Postgres 18 container a clean volume rather than mounting the old
+  # 16-format one, which would simply fail to start. The old volume is left untouched
+  # as a second safety net alongside the pg_dump backup taken before this migration.
   pgdata:
+    name: papertick_pgdata_pg18
   redisdata:

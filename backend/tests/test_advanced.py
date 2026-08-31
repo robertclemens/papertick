@@ -19,6 +19,7 @@ from app.models import (
     PositionSide,
     QuantityType,
     TaxLot,
+    utcnow,
 )
 from app.schemas import OptionOrderIn, OrderCreateIn, SpecLotIn
 from app.services import options as opt
@@ -386,7 +387,10 @@ def test_activity_feed_sorts_by_effective_date(db, user, taxable):
                           scenario=db.get(Scenario, taxable.scenario_id))
     feed = list_transactions(None, 10, "effective", principal, db)
     assert [t.as_of for t in feed] == sorted((t.as_of for t in feed), reverse=True)
-    assert feed[0].as_of == date.today()
+    # the "today" order's as_of is stamped by the app as utcnow().date() (ledger
+    # dates are UTC everywhere), which can differ from local date.today() near
+    # midnight in timezones behind UTC -- compare like for like.
+    assert feed[0].as_of == utcnow().date()
 
     audit = list_transactions(None, 10, "executed", principal, db)
     assert audit[0].as_of == date.today() - timedelta(days=200)  # entered last

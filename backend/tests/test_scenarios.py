@@ -18,6 +18,7 @@ from app.models import (
     TaxLot,
     Transaction,
     User,
+    utcnow,
 )
 from app.schemas import OrderCreateIn
 from app.services import metrics, scenarios, trading
@@ -110,9 +111,12 @@ def test_copy_brings_balances_and_holdings_but_no_history(db, user, taxable, sce
     pos = db.query(Position).filter_by(account_id=clone.id).one()
     assert Decimal(pos.shares) == Decimal(source_shares)
 
-    # …priced at today, so the scenario starts flat rather than inheriting gains
+    # …priced at today, so the scenario starts flat rather than inheriting gains.
+    # scenarios.create() stamps this as utcnow().date() (ledger dates are UTC
+    # everywhere), which can differ from local date.today() near midnight in
+    # timezones behind UTC -- compare like for like.
     lot = db.query(TaxLot).filter_by(account_id=clone.id).one()
-    assert lot.acquired_on == date.today()
+    assert lot.acquired_on == utcnow().date()
     view = metrics.positions_view(db, user, None, copy.id)[0]
     assert abs(view.unrealized_gains) < Decimal("0.02")
 

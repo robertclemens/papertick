@@ -11,7 +11,10 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ARG BACKEND_URL=http://backend:8000
-ENV NEXT_TELEMETRY_DISABLED=1 BACKEND_URL=$BACKEND_URL
+# Sub-folder deployments (e.g. BASE_PATH=/papertick). Empty = domain root.
+# Both are compiled into the build output, so changing either needs a rebuild.
+ARG BASE_PATH=""
+ENV NEXT_TELEMETRY_DISABLED=1 BACKEND_URL=$BACKEND_URL BASE_PATH=$BASE_PATH
 RUN npm run build
 
 FROM node:24-alpine AS runner

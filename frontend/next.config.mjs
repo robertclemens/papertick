@@ -2,6 +2,13 @@
 const backend = process.env.BACKEND_URL || "http://localhost:8000";
 const dev = process.env.NODE_ENV !== "production";
 
+// Sub-folder deployments: BASE_PATH="/papertick" serves the whole app under
+// https://domain.example/papertick/ behind a reverse proxy that passes the
+// prefix through untouched. Empty (the default) serves it at a domain root.
+// Baked into the route manifest at build time, so a change needs `--build`.
+const rawBase = (process.env.BASE_PATH || "").trim().replace(/\/+$/, "");
+const basePath = rawBase && !rawBase.startsWith("/") ? `/${rawBase}` : rawBase;
+
 // Next injects an inline bootstrap script and inline styles it does not
 // nonce for us, so 'unsafe-inline' stays for now; everything else is pinned
 // to this origin. There is no CDN in the page — the API docs serve Swagger
@@ -46,15 +53,23 @@ const nextConfig = {
   output: "standalone",
   // Don't advertise the framework and its major version to a scanner.
   poweredByHeader: false,
+  ...(basePath ? { basePath } : {}),
+  // Inlined into the client bundle at build time. next/link, useRouter and
+  // usePathname handle basePath themselves; raw fetch() calls and <a href> to
+  // a backend route have to prefix it (see lib/base-path.ts).
+  env: { NEXT_PUBLIC_BASE_PATH: basePath },
   async rewrites() {
     // Proxy the API through the frontend origin so httpOnly auth cookies are first-party.
+    // Sources carry the basePath explicitly (hence `basePath: false`, so Next
+    // does not prepend it a second time); the backend is always mounted at
+    // /api, so the prefix is dropped on the way through.
     return [
-      { source: "/api/:path*", destination: `${backend}/api/:path*` },
-      { source: "/healthz", destination: `${backend}/healthz` },
+      { source: `${basePath}/api/:path*`, destination: `${backend}/api/:path*`, basePath: false },
+      { source: `${basePath}/healthz`, destination: `${backend}/healthz`, basePath: false },
     ];
   },
   async headers() {
-    return [{ source: "/:path*", headers: securityHeaders }];
+    return [{ source: `${basePath}/:path*`, headers: securityHeaders, basePath: false }];
   },
 };
 

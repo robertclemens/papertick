@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import { withBasePath } from "@/lib/base-path";
 import { api, ApiError } from "@/lib/api";
 import { dateTime } from "@/lib/format";
 import { Badge, Card, Dialog, Empty, ErrorText, InfoText, Spinner } from "@/components/ui";
@@ -75,7 +76,7 @@ export default function KeysPage() {
             Full platform access for CLI tools and AI agents. Send as{" "}
             <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs">Authorization: Bearer ptk_…</code>{" "}
             — see the{" "}
-            <a href="/api/docs" target="_blank" rel="noopener noreferrer"
+            <a href={withBasePath("/api/docs")} target="_blank" rel="noopener noreferrer"
                className="font-medium text-emerald-400 hover:text-emerald-300">
               interactive API reference
             </a>{" "}
@@ -83,7 +84,7 @@ export default function KeysPage() {
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
-          <a className="btn-ghost" href="/api/docs" target="_blank" rel="noopener noreferrer">
+          <a className="btn-ghost" href={withBasePath("/api/docs")} target="_blank" rel="noopener noreferrer">
             API docs ↗
           </a>
           <button className="btn-primary" onClick={() => { setOpen(true); setError(""); }}>

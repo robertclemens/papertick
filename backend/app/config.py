@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:3000"
     cookie_secure: bool = False
 
+    # Sub-folder the UI is served under behind a reverse proxy ("" at a domain
+    # root, "/papertick" for https://domain.example/papertick/). Only affects
+    # links generated back into the app: FRONTEND_ORIGIN stays a bare origin
+    # because CORS, the cross-origin guard and WebAuthn all compare against the
+    # browser's Origin header, which never carries a path.
+    base_path: str = ""
+
     # Comma-separated CIDRs of reverse proxies whose X-Forwarded-For may be
     # believed. Empty (the default) means trust nothing: the peer address is
     # used, so a client cannot pick its own rate-limit bucket. Set this to the
@@ -75,6 +82,19 @@ class Settings(BaseSettings):
     # WebAuthn / passkeys. rp_id defaults to the FRONTEND_ORIGIN hostname.
     webauthn_rp_id: str = ""
     webauthn_rp_name: str = "PaperTick"
+
+    @field_validator("base_path")
+    @classmethod
+    def _normalize_base_path(cls, v: str) -> str:
+        v = v.strip().rstrip("/")
+        if v and not v.startswith("/"):
+            v = "/" + v
+        return v
+
+    @property
+    def app_url(self) -> str:
+        """Public URL of the web UI, sub-folder included."""
+        return self.frontend_origin.rstrip("/") + self.base_path
 
     @property
     def rp_id(self) -> str:

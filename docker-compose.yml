@@ -7,6 +7,9 @@ x-backend-env: &backend-env
   ENV: ${ENV:-development}
   COOKIE_SECURE: ${COOKIE_SECURE:-false}
   FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+  # Sub-folder prefix the UI is served under; used to build links that point
+  # back into the app (verification emails, the API docs' "back to the app").
+  BASE_PATH: ${BASE_PATH:-}
   # Host values this deployment answers to; empty disables the check.
   ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
   # CIDRs of proxies whose X-Forwarded-For may be believed. Empty = trust none,
@@ -26,6 +29,7 @@ x-backend-env: &backend-env
   RISK_FREE_RATE: ${RISK_FREE_RATE:-0.045}
   ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-900}
   REFRESH_TOKEN_TTL_SECONDS: ${REFRESH_TOKEN_TTL_SECONDS:-604800}
+  MFA_TOKEN_TTL_SECONDS: ${MFA_TOKEN_TTL_SECONDS:-300}
   LOGIN_MAX_FAILURES: ${LOGIN_MAX_FAILURES:-10}
   LOGIN_LOCKOUT_SECONDS: ${LOGIN_LOCKOUT_SECONDS:-900}
   SMTP_HOST: ${SMTP_HOST:-}
@@ -152,8 +156,12 @@ services:
       context: ./frontend
       args:
         BACKEND_URL: http://backend:8000
+        # Sub-folder deployment prefix (e.g. /papertick). Compiled into the
+        # build, so a change to it only takes effect with `up -d --build`.
+        BASE_PATH: ${BASE_PATH:-}
     environment:
       BACKEND_URL: http://backend:8000
+      BASE_PATH: ${BASE_PATH:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
     depends_on:
       backend:

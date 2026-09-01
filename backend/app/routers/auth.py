@@ -58,23 +58,41 @@ def _bearer(request: Request) -> str | None:
     return auth[7:].strip() if auth.lower().startswith("bearer ") else None
 
 
+def _cookie_paths() -> tuple[str, str]:
+    """(access, refresh) cookie paths, sub-folder deployments included.
+
+    A cookie path is matched against the URL the browser requested, which still
+    carries BASE_PATH — the prefix is only stripped later, by the frontend's
+    proxy. Without it here the refresh cookie would be scoped to a path that is
+    never requested and would simply never be sent back.
+
+    Scoping the access cookie to the app's own prefix rather than the whole
+    domain is also the tighter choice: on a shared hostname the session is not
+    handed to whatever else lives there.
+    """
+    base = get_settings().base_path
+    return base or "/", f"{base}/api/v1/auth"
+
+
 def _set_cookies(response: Response, access: str, refresh: str) -> None:
     s = get_settings()
+    access_path, refresh_path = _cookie_paths()
     response.set_cookie(
         ACCESS_COOKIE, access,
         max_age=s.access_token_ttl_seconds, httponly=True,
-        samesite="lax", secure=s.cookie_secure, path="/",
+        samesite="lax", secure=s.cookie_secure, path=access_path,
     )
     response.set_cookie(
         REFRESH_COOKIE, refresh,
         max_age=s.refresh_token_ttl_seconds, httponly=True,
-        samesite="lax", secure=s.cookie_secure, path="/api/v1/auth",
+        samesite="lax", secure=s.cookie_secure, path=refresh_path,
     )
 
 
 def _clear_cookies(response: Response) -> None:
-    response.delete_cookie(ACCESS_COOKIE, path="/")
-    response.delete_cookie(REFRESH_COOKIE, path="/api/v1/auth")
+    access_path, refresh_path = _cookie_paths()
+    response.delete_cookie(ACCESS_COOKIE, path=access_path)
+    response.delete_cookie(REFRESH_COOKIE, path=refresh_path)
 
 
 def _issue_tokens(db: Session, user: User, response: Response) -> TokenPair:

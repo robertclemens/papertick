@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { withBasePath } from "@/lib/base-path";
 import { ACCOUNT_TYPE_LABEL, AccountT, api, TaxReportT } from "@/lib/api";
 import { money } from "@/lib/format";
 import { Card, InfoText, Spinner } from "@/components/ui";
@@ -33,7 +34,7 @@ export default function TaxesPage() {
     api<TaxReportT>(`/tax/report?year=${year}${q}`).then(setReport).catch(() => {});
   }, [year, accountId]);
 
-  const csvHref = `/api/v1/tax/report.csv?year=${year}${accountId ? `&account_id=${accountId}` : ""}`;
+  const csvHref = withBasePath(`/api/v1/tax/report.csv?year=${year}${accountId ? `&account_id=${accountId}` : ""}`);
   const totalGains = report
     ? parseFloat(report.short_term_gains) + parseFloat(report.long_term_gains) + parseFloat(report.unclassified_gains)
     : 0;

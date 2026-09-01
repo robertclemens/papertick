@@ -59,7 +59,7 @@ app = FastAPI(
     openapi_url="/api/openapi.json" if _EXPOSE_DOCS_ANON else None,
 )
 
-docs_ui.install(app, settings.frontend_origin, public=_EXPOSE_DOCS_ANON)
+docs_ui.install(app, settings.app_url, public=_EXPOSE_DOCS_ANON)
 
 # A request whose Host we do not recognise is rejected outright, so a spoofed
 # Host can never reach routing, a cache, or a generated URL.

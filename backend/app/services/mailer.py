@@ -49,7 +49,7 @@ def send_email(to: str, subject: str, body: str) -> bool:
 
 
 def send_verification_email(to: str, token: str) -> bool:
-    url = f"{get_settings().frontend_origin}/verify-email?token={token}"
+    url = f"{get_settings().app_url}/verify-email?token={token}"
     return send_email(
         to,
         "Verify your PaperTick account",
@@ -60,7 +60,7 @@ def send_verification_email(to: str, token: str) -> bool:
 
 
 def send_email_change_email(to: str, token: str) -> bool:
-    url = f"{get_settings().frontend_origin}/verify-email?token={token}"
+    url = f"{get_settings().app_url}/verify-email?token={token}"
     return send_email(
         to,
         "Confirm your new PaperTick email address",

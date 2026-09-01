@@ -1,5 +1,7 @@
 "use client";
 
+import { withBasePath } from "@/lib/base-path";
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -36,7 +38,7 @@ let refreshing: Promise<boolean> | null = null;
 
 async function tryRefresh(): Promise<boolean> {
   if (!refreshing) {
-    refreshing = fetch("/api/v1/auth/refresh", { method: "POST", credentials: "include" })
+    refreshing = fetch(withBasePath("/api/v1/auth/refresh"), { method: "POST", credentials: "include" })
       .then((r) => r.ok)
       .catch(() => false)
       .finally(() => setTimeout(() => (refreshing = null), 0));
@@ -53,7 +55,7 @@ export async function api<T = any>(
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const scenario = getScenario();
   if (scenario) headers["X-Scenario-Id"] = scenario;
-  const res = await fetch(`/api/v1${path}`, {
+  const res = await fetch(withBasePath(`/api/v1${path}`), {
     method,
     credentials: "include",
     headers: Object.keys(headers).length ? headers : undefined,
@@ -63,7 +65,7 @@ export async function api<T = any>(
     if (await tryRefresh()) {
       return api<T>(path, { method, body, retry: false });
     }
-    if (typeof window !== "undefined") window.location.href = "/login";
+    if (typeof window !== "undefined") window.location.href = withBasePath("/login");
     throw new ApiError(401, "Session expired");
   }
   if (res.status === 204) return undefined as T;
@@ -94,13 +96,13 @@ export async function download(path: string, fallbackName: string): Promise<void
     credentials: "include",
     headers: scenario ? { "X-Scenario-Id": scenario } : undefined,
   };
-  let res = await fetch(`/api/v1${path}`, init);
+  let res = await fetch(withBasePath(`/api/v1${path}`), init);
   if (res.status === 401) {
     if (!(await tryRefresh())) {
-      if (typeof window !== "undefined") window.location.href = "/login";
+      if (typeof window !== "undefined") window.location.href = withBasePath("/login");
       throw new ApiError(401, "Session expired");
     }
-    res = await fetch(`/api/v1${path}`, init);
+    res = await fetch(withBasePath(`/api/v1${path}`), init);
   }
   if (!res.ok) throw new ApiError(res.status, `Export failed (${res.status})`);
 

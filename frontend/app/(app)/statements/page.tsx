@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { withBasePath } from "@/lib/base-path";
 import { api, StatementT } from "@/lib/api";
 import { shortDate } from "@/lib/format";
 import { Card, Empty, Spinner } from "@/components/ui";
@@ -94,7 +95,7 @@ export default function StatementsPage() {
                     </div>
                     <a
                       className="btn-ghost !py-1.5 text-xs"
-                      href={`/api/v1/statements/${s.id}.pdf`}
+                      href={withBasePath(`/api/v1/statements/${s.id}.pdf`)}
                       target="_blank"
                       rel="noopener noreferrer"
                     >

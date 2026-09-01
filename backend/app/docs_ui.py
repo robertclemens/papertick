@@ -279,9 +279,12 @@ STATIC_DIR = Path(__file__).parent / "static"
 # unauthenticated page on the API's own origin must not execute third-party
 # JavaScript pinned to a floating version with no integrity hash. See
 # app/static/README.md.
-SWAGGER_JS = "/api/docs-assets/swagger-ui-bundle.js"
-SWAGGER_CSS_URL = "/api/docs-assets/swagger-ui.css"
-REDOC_JS = "/api/docs-assets/redoc.standalone.js"
+# Relative to /api/, which is where both pages live: at a domain root the
+# browser resolves them to /api/docs-assets/..., and behind a sub-folder proxy
+# (BASE_PATH) to /papertick/api/docs-assets/... — no prefix to thread through.
+SWAGGER_JS = "docs-assets/swagger-ui-bundle.js"
+SWAGGER_CSS_URL = "docs-assets/swagger-ui.css"
+REDOC_JS = "docs-assets/redoc.standalone.js"
 
 # The docs pages do render markup, so they cannot use the API's `default-src
 # 'none'` policy — but everything they load now comes from this origin.
@@ -311,6 +314,9 @@ def install(app: FastAPI, app_url: str, public: bool = True) -> None:
     app.mount("/api/docs-assets", StaticFiles(directory=STATIC_DIR), name="docs-assets")
 
     spec_url = "/api/openapi.json"
+    # What the pages *reference* — relative, so it resolves under a sub-folder
+    # deployment too. What the route is *mounted* at stays absolute.
+    spec_href = "openapi.json"
     if not public:
         @app.get(spec_url, include_in_schema=False, dependencies=guard)
         def openapi_spec() -> JSONResponse:
@@ -319,7 +325,7 @@ def install(app: FastAPI, app_url: str, public: bool = True) -> None:
     @app.get("/api/docs", include_in_schema=False, dependencies=guard)
     def swagger_ui() -> HTMLResponse:
         html = get_swagger_ui_html(
-            openapi_url=app.openapi_url or spec_url,
+            openapi_url=spec_href,
             title=f"{app.title} — reference",
             swagger_js_url=SWAGGER_JS,
             swagger_css_url=SWAGGER_CSS_URL,
@@ -333,7 +339,7 @@ def install(app: FastAPI, app_url: str, public: bool = True) -> None:
         body = body.replace("<html>", '<html class="dark-mode">', 1)
         body = body.replace("</head>", f"<style>{SWAGGER_CSS}{CHROME_CSS}</style></head>")
         body = body.replace(
-            "<body>", f"<body>{_chrome(app_url, ('/api/redoc', 'ReDoc'))}", 1
+            "<body>", f"<body>{_chrome(app_url, ('redoc', 'ReDoc'))}", 1
         )
         return _docs_response(body)
 
@@ -342,10 +348,10 @@ def install(app: FastAPI, app_url: str, public: bool = True) -> None:
         html = REDOC_HTML
         for key, value in {
             "__TITLE__": f"{app.title} — reference",
-            "__SPEC__": app.openapi_url or spec_url,
+            "__SPEC__": spec_href,
             "__CSS__": REDOC_CSS,
             "__REDOC_JS__": REDOC_JS,
-            "__BAR__": _chrome(app_url, ("/api/docs", "Swagger UI")),
+            "__BAR__": _chrome(app_url, ("docs", "Swagger UI")),
             "__BG__": BG, "__CARD__": CARD, "__BORDER__": BORDER, "__TEXT__": TEXT,
             "__MUTED__": MUTED, "__ACCENT__": ACCENT, "__CODE__": CODE, "__TYPE__": TYPE,
             "__RAISED__": RAISED,

@@ -32,7 +32,7 @@ No real money, real market discipline.
 
 | Layer | Technology |
 |---|---|
-| Frontend | Next.js 16 (App Router) · React 19 · Tailwind CSS 4 · Recharts 3 |
+| Frontend | Next.js 16 (App Router) · React 19 · Tailwind CSS 4 · Recharts 3 · TypeScript 7 |
 | Backend | Python 3.14 · FastAPI · SQLAlchemy 2 · Pydantic v2 |
 | Database | PostgreSQL 18 (ACID ledger, `SELECT … FOR UPDATE` locking) |
 | Queue / cache | Redis 8 + Celery (worker + beat) |
@@ -53,16 +53,19 @@ papertick/
 │   │   ├── config.py      # Settings (pydantic-settings, env-driven)
 │   │   ├── models.py      # SQLAlchemy ORM models
 │   │   ├── schemas.py     # Pydantic request/response models
+│   │   ├── security.py    # Argon2id, JWTs, API keys, TOTP sealing
+│   │   ├── deps.py        # auth dependencies, scopes, scenario resolution
+│   │   ├── docs_ui.py     # themed, self-hosted Swagger UI + ReDoc
 │   │   ├── init_db.py     # schema create/migrate + reference-data seed
 │   │   ├── routers/       # one module per API resource
 │   │   ├── services/      # business logic (trading, IRS rules, metrics, …)
 │   │   └── workers/       # Celery app + scheduled tasks
-│   ├── tests/              # pytest suite (sqlite + synthetic market data)
-│   └── scripts/            # one-off/import scripts (e.g. Vanguard CSV import)
+│   ├── tests/             # pytest suite (sqlite + synthetic market data)
+│   └── scripts/           # one-off/import scripts (e.g. Vanguard CSV import)
 └── frontend/
-    ├── app/                # Next.js App Router pages
-    ├── components/         # shared React components
-    └── lib/                # API client, formatting, client-side helpers
+    ├── app/               # Next.js App Router pages
+    ├── components/        # shared React components
+    └── lib/               # API client, formatting, client-side helpers
 ```
 
 ## Quick start
@@ -74,15 +77,21 @@ local dependencies are needed — Postgres, Redis, and both apps run in containe
 git clone https://github.com/robertclemens/papertick.git
 cd papertick
 cp .env.example .env
-# fill in the two required secrets:
+# fill in the three required secrets:
 #   POSTGRES_PASSWORD=$(openssl rand -hex 24)
+#   REDIS_PASSWORD=$(openssl rand -base64 36)
 #   SECRET_KEY=$(openssl rand -hex 48)
 docker compose up -d --build
 ```
 
 - Web UI: http://localhost:3000
-- API docs (OpenAPI/Swagger): http://localhost:8000/api/docs
-- Health: http://localhost:8000/healthz
+- API docs (OpenAPI/Swagger): http://localhost:3000/api/docs
+- Health: http://localhost:3000/healthz
+
+Everything is served through the `frontend` container on port 3000 (change it with
+`FRONTEND_PORT`). The backend's own port is deliberately never published —
+`frontend` proxies `/api/*` and `/healthz` to it over the internal Docker network,
+which is also what makes the auth cookies first-party.
 
 Create an account in the UI (password: 12+ chars, letters + digits), deposit cash into a
 bucket, and trade. Watch startup with `docker compose logs -f backend`; the backend
@@ -91,20 +100,36 @@ healthcheck (and everything that depends on it) won't pass until schema init fin
 ## Configuration
 
 Every setting is documented inline in [`.env.example`](.env.example) — copy it to `.env`
-and edit. The two secrets (`POSTGRES_PASSWORD`, `SECRET_KEY`) are required; everything
-else has a sane default. Variables are grouped there by concern:
+and edit. It is split into **required for production** first, then **optional** settings
+that all have working defaults. Grouped by concern:
 
-- **Environment** — `ENV` (development/production), `COOKIE_SECURE`, `FRONTEND_ORIGIN`, `FRONTEND_PORT`
-- **Market data** — provider selection and optional paid API keys (see [Market data modes](#market-data-modes))
-- **Market emulation** — `ENFORCE_MARKET_HOURS`, `ALLOW_BACKDATED_TRADES`, simulated fees/slippage
-- **Sessions & login security** — token lifetimes, lockout thresholds
-- **Email** — SMTP for verification links (optional; links log to stdout if unset)
+*Required for production*
+
+- **Secrets** — `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `SECRET_KEY` (all three are
+  needed for the stack to start at all, in any environment)
+- **Environment** — `ENV` (development/production), `COOKIE_SECURE`, `FRONTEND_ORIGIN`,
+  `ALLOWED_HOSTS`
+- **Email** — `SMTP_*`, for the verification links that `ENV=production` makes mandatory
+
+*Optional*
+
+- **Deployment shape** — `BASE_PATH` (serve from a sub-folder — see
+  [Reverse proxy](#reverse-proxy)), `FRONTEND_PORT`, `TRUSTED_PROXY_CIDRS`
 - **Passkeys (WebAuthn)** — relying-party identity
+- **Market data** — provider selection and optional paid API keys (see
+  [Market data modes](#market-data-modes))
+- **Market emulation** — `ENFORCE_MARKET_HOURS`, `ALLOW_BACKDATED_TRADES`
+- **Simulated trading costs** — fees, slippage, risk-free rate, settlement yield,
+  scenario retention
+- **Sessions & login security** — token lifetimes, lockout thresholds
 - **Optional demo account** — seeded only if `DEMO_MODE=true`
 
 `docker-compose.yml` passes every one of these through to the `backend`, `worker`, and
 `beat` containers with matching defaults, so `.env` is the single source of truth —
-nothing needs editing in the compose file itself for normal configuration changes.
+nothing needs editing in the compose file itself for normal configuration changes. The
+two exceptions are `DATABASE_URL` and `REDIS_URL`, which compose builds from the
+passwords above; they are documented at the bottom of `.env.example` for the case where
+a backend process is run outside Compose.
 
 ## Features
 
@@ -113,10 +138,15 @@ nothing needs editing in the compose file itself for normal configuration change
   mutual funds are forward-priced at the daily closing NAV (4 PM ET cutoff), never
   intraday; limit orders only work while the market trades. Set
   `ENFORCE_MARKET_HOURS=false` for an always-open sandbox.
+- **Settlement fund** — uninvested cash is not a bare balance: it sits in a federal
+  money market fund modeled on VMFXX at a stable $1.00 NAV. Deposits and sale
+  proceeds sweep in, purchases and withdrawals sweep out, and the balance accrues
+  the fund's dividend daily, paid on the last day of each month. No settlement or
+  clearing holds are modeled — swept-in cash is available immediately.
 - **Dividends** — real dividend history is credited for shares held on each
   ex-date, including full backfill for backdated (backtest) positions, and flows
   into balances, performance, and the tax report. Reconciliation is idempotent and
-  runs continuously.
+  re-runs every few hours.
 - **Tax lots & taxable income** — full lot tracking (fees in basis, backtests earn
   their real holding period), every sale split into short-/long-term gains, and a
   per-year tax report (gains, dividend income, IRA contributions by designation,
@@ -163,6 +193,7 @@ nothing needs editing in the compose file itself for normal configuration change
   realized/unrealized gains. All fills run inside DB transactions with row locks.
 - **Backtesting** — place an order `as_of` a past date ("pretend I invested then");
   it fills at that day's close and flows into today's balances and performance.
+  Off by default — set `ALLOW_BACKDATED_TRADES=true`.
 - **Scheduled & recurring investing** — one-off future orders and recurring rules
   (daily, weekly, biweekly, monthly, quarterly, annually) executed by the Celery
   worker; rules can be edited (amount, symbol, cadence) with changes applying to
@@ -183,8 +214,13 @@ nothing needs editing in the compose file itself for normal configuration change
   them at expiry and releases the cash or shares they were holding.
 - **Metrics** — portfolio value series rebuilt from the ledger, time-weighted return,
   annualized IRR (XIRR), cost basis, fees, net deposits.
-- **Agentic API** — 100% of functionality over REST with OpenAPI docs. Scoped API keys
-  (`read`, `trade`) via `Authorization: Bearer ptk_…`.
+- **Exports** — every History view downloads as CSV or Excel over the window the
+  table is showing; a whole scenario exports to a JSON file signed with
+  `SECRET_KEY`, so a hand-edited file is rejected on import.
+- **Agentic API** — every feature is reachable over REST, documented by a live
+  OpenAPI spec. Scoped API keys (`read`, `trade`) via `Authorization: Bearer ptk_…`
+  cover reading and trading; creating accounts, managing scenarios and changing
+  credentials need a signed-in session (see [below](#using-the-api-as-an-agent)).
 
 ## Accounts & sign-in
 
@@ -208,45 +244,70 @@ nothing needs editing in the compose file itself for normal configuration change
 - Short-lived JWT access tokens + rotating refresh tokens (hashed at rest,
   reuse detection revokes the whole session family).
 - httpOnly, SameSite=Lax cookies, first-party via the Next.js proxy; `Secure` when
-  `COOKIE_SECURE=true` behind TLS.
+  `COOKIE_SECURE=true` behind TLS. The refresh cookie is scoped to the one route
+  that consumes it, and a server-side origin check backs up SameSite on every
+  cookie-authenticated state change.
 - TOTP MFA — secret encrypted at rest (Fernet key HKDF-derived from `SECRET_KEY`),
   QR enrollment, password + code required to disable.
 - Redis rate limiting on auth/trading endpoints; login lockout after repeated failures;
-  timing-equalized login for unknown emails.
+  timing-equalized login for unknown emails. Redis itself requires a password, so a
+  process that reaches the network cannot clear a lockout or set a fill price.
 - API keys stored as SHA-256 hashes; plaintext shown exactly once; scoped; revocable.
-- Strict Pydantic validation with bounds on every money/shares input; tradable universe
-  restricted to the seeded asset table; security headers on both services;
-  non-root containers.
+- The backend port is never published: only `frontend` is reachable from the host,
+  so there is no route around TLS or the ingress. `ALLOWED_HOSTS` rejects a spoofed
+  `Host`, and `X-Forwarded-For` is believed only from CIDRs you list in
+  `TRUSTED_PROXY_CIDRS` (nothing, by default), so a caller cannot choose its own
+  rate-limit bucket.
+- Strict Pydantic validation with bounds on every money/shares input; request bodies
+  capped at 8 MiB before parsing; only US-listed USD symbols the market-data source
+  can confirm become tradable. Security headers and a strict CSP on both services;
+  Swagger UI and ReDoc are served from the backend's own origin rather than a CDN;
+  non-root containers with `no-new-privileges` and dropped capabilities.
+- In `ENV=production` the API docs, ReDoc and the OpenAPI spec are served only to an
+  authenticated caller — the full map of the attack surface is not handed to
+  anonymous visitors.
 
 ## Using the API as an agent
 
 ```bash
 # create a key in the UI (API Keys page), then:
 export PT_KEY=ptk_...
+export PT_URL=http://localhost:3000      # or https://yourdomain.example
 
-curl -s -H "Authorization: Bearer $PT_KEY" localhost:8000/api/v1/portfolio/summary
+curl -s -H "Authorization: Bearer $PT_KEY" $PT_URL/api/v1/portfolio/summary
 
 # buy $500 of VOO at the current price
 curl -s -X POST -H "Authorization: Bearer $PT_KEY" -H "Content-Type: application/json" \
   -d '{"account_id":"<uuid>","ticker":"VOO","side":"BUY","quantity_type":"DOLLARS","quantity":"500"}' \
-  localhost:8000/api/v1/orders
+  $PT_URL/api/v1/orders
 
 # backtest: pretend you bought $10k of AAPL three years ago
+# (needs ALLOW_BACKDATED_TRADES=true)
 curl -s -X POST -H "Authorization: Bearer $PT_KEY" -H "Content-Type: application/json" \
   -d '{"account_id":"<uuid>","ticker":"AAPL","side":"BUY","quantity_type":"DOLLARS","quantity":"10000","as_of":"2023-08-29"}' \
-  localhost:8000/api/v1/orders
+  $PT_URL/api/v1/orders
 
 # $500 of VOO every 1st of the month
 curl -s -X POST -H "Authorization: Bearer $PT_KEY" -H "Content-Type: application/json" \
   -d '{"account_id":"<uuid>","ticker":"VOO","amount":"500","cadence":"MONTHLY","day_of_month":1}' \
-  localhost:8000/api/v1/schedules
+  $PT_URL/api/v1/schedules
 ```
+
+Note the base URL: the API is reached **through the frontend origin**, not a separate
+backend port. Requests go to the same host and scheme the web UI is served on.
+
+**Scopes.** An API key carries `read` and/or `trade` — enough to query everything and
+to deposit, withdraw, trade, and schedule. Administration (creating or editing
+accounts, cost-basis settings, scenarios, API keys, MFA and passkeys) requires the
+`manage` scope, which only an interactive session holds. In practice: set the
+accounts up in the UI, then let the agent run inside them.
 
 Every response carries `X-Scenario-Id`/`X-Scenario-Name` so a caller always knows which
 portfolio track answered; pin one explicitly with an `X-Scenario-Id` header or
 `?scenario_id=` query param. The full, always-current contract is the live OpenAPI spec —
 `GET /api/openapi.json`, or browse it interactively at `/api/docs` (Swagger) or
-`/api/redoc` (ReDoc).
+`/api/redoc` (ReDoc). Under `ENV=production` all three require an authenticated
+caller, so pass your API key when fetching the spec.
 
 ## Market data modes
 
@@ -273,8 +334,18 @@ cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements-dev
 .venv/bin/python -m pytest tests/ -q
 
 # frontend
-cd frontend && npm install && npm run dev   # expects backend on localhost:8000
+cd frontend && npm install && npm run dev   # expects a backend on localhost:8000
 ```
+
+`npm run dev` proxies to `BACKEND_URL` (default `http://localhost:8000`). Compose does
+not publish the backend's port, so either run the API yourself —
+
+```bash
+cd backend && SECRET_KEY=$(openssl rand -hex 48) .venv/bin/uvicorn app.main:app --reload
+```
+
+— or add `ports: ["127.0.0.1:8000:8000"]` to the `backend` service in a
+`docker-compose.override.yml` while you work.
 
 Schema is created and seeded automatically on backend start (`app/init_db.py`).
 The tradable universe and IRS limits are seed data — extend them in `init_db.py`.
@@ -283,33 +354,38 @@ The tradable universe and IRS limits are seed data — extend them in `init_db.p
 
 | Service | Role | Port |
 |---|---|---|
-| `frontend` | Next.js UI, proxies `/api/*` to the backend | 3000 |
-| `backend` | FastAPI (uvicorn, 2 workers) | 8000 |
+| `frontend` | Next.js UI; proxies `/api/*` and `/healthz` to the backend | `FRONTEND_PORT` (3000) → 3000 |
+| `backend` | FastAPI (uvicorn, 2 workers) | internal only — not published |
 | `worker` | Celery worker — fills scheduled/recurring/limit orders | — |
-| `beat` | Celery beat — 60 s tick | — |
-| `db` | PostgreSQL 16 + volume | — |
-| `redis` | Cache, rate limits, Celery broker + volume | — |
+| `beat` | Celery beat — 60 s order sweep plus the daily/periodic maintenance jobs | — |
+| `db` | PostgreSQL 18 + `pgdata` volume | internal only |
+| `redis` | Cache, rate limits, Celery broker + `redisdata` volume | internal only |
 
 ## Deploying to production
 
 1. Set `ENV=production` — this turns on required email verification for signup
-   and email changes.
+   and email changes, and stops serving the API docs and OpenAPI spec anonymously.
 2. Set `COOKIE_SECURE=true` and put the stack behind TLS — neither container
    terminates TLS itself, so a reverse proxy in front of the `frontend`
    service handles that; see [Reverse proxy](#reverse-proxy) for concrete
    Caddy/nginx/Apache configs.
-3. Set `FRONTEND_ORIGIN` to the real public URL — it drives CORS, WebAuthn
-   relying-party checks, and links in verification emails. Passkeys need a
-   secure context, so this must be `https://` outside of `localhost` development.
-4. Configure `SMTP_*` so verification emails actually send (unset SMTP just
+3. Set `FRONTEND_ORIGIN` to the real public origin — it drives CORS, the
+   cross-origin guard, WebAuthn relying-party checks, and links in verification
+   emails. Scheme, host and port only, never a path; passkeys need a secure
+   context, so this must be `https://` outside of `localhost` development. If the
+   app is served from a sub-folder, that prefix goes in `BASE_PATH` instead.
+4. Set `ALLOWED_HOSTS` to the hostname(s) the deployment answers to, so a spoofed
+   `Host` header is rejected outright.
+5. Configure `SMTP_*` so verification emails actually send (unset SMTP just
    logs the link server-side, which is fine for a private/demo deployment but
    not for real signups).
-5. Generate fresh, unique secrets for that deployment — never reuse the
-   `.env` from development. `POSTGRES_PASSWORD` and `SECRET_KEY` as shown in
-   [Quick start](#quick-start); rotating `SECRET_KEY` invalidates all sessions
-   and enrolled TOTP secrets, so treat it as a real credential.
-6. Leave `DEMO_MODE=false` (the default) — it exists for local trial accounts only.
-7. `docker compose up -d --build`. `pgdata`/`redisdata` are named volumes;
+6. Generate fresh, unique secrets for that deployment — never reuse the
+   `.env` from development. `POSTGRES_PASSWORD`, `REDIS_PASSWORD` and `SECRET_KEY`
+   as shown in [Quick start](#quick-start); rotating `SECRET_KEY` invalidates all
+   sessions, enrolled TOTP secrets and existing scenario exports, so treat it as a
+   real credential.
+7. Leave `DEMO_MODE=false` (the default) — it exists for local trial accounts only.
+8. `docker compose up -d --build`. `pgdata`/`redisdata` are named volumes;
    back them up like any other stateful service.
 
 ## Reverse proxy
@@ -320,9 +396,8 @@ Its Next.js rewrites (`frontend/next.config.mjs`) already forward `/api/*` and
 why auth cookies work as first-party (see [Security posture](#security-posture)).
 So one upstream, one TLS certificate, one vhost: the web UI, the OpenAPI docs
 (`/api/docs`, `/api/redoc`), and every `/api/v1/...` call an agent makes all arrive
-through `frontend:3000`. Don't configure a separate proxy path to `backend:8000` —
-it isn't needed, and leaving it unpublished (or firewalled) is one less thing exposed
-to the internet than pointing at both.
+through `frontend:3000`. There is no separate proxy path to configure for
+`backend:8000` — compose does not publish it at all.
 
 If the proxy runs on the same host as `docker compose`, bind the published port to
 loopback so only the proxy — not the world — can reach it directly, e.g. in a
@@ -335,14 +410,38 @@ services:
       - "127.0.0.1:3000:3000"
 ```
 
-Whichever proxy you use, forward `Host`, `X-Forwarded-For`, and `X-Forwarded-Proto` —
-Next.js and the app's own security-headers middleware don't need them to function
-(`FRONTEND_ORIGIN` is a static setting, not derived from request headers), but
-they're standard practice for correct logging and client IPs upstream. Get a
-certificate from Let's Encrypt (or any ACME CA) for all three; Caddy does this
-automatically.
+Whichever proxy you use, forward `Host`, `X-Forwarded-For`, and `X-Forwarded-Proto`.
+The app functions without them — `FRONTEND_ORIGIN` is a static setting, not derived
+from request headers — but they are what upstream logging and client IPs are built
+from, and `X-Forwarded-For` is required if you ever set `TRUSTED_PROXY_CIDRS`.
+Get a certificate from Let's Encrypt (or any ACME CA) for the hostname you serve;
+Caddy does this automatically.
+
+### Two shapes
+
+- **Own hostname** — `https://papertick.example`. Nothing extra to configure; this
+  is the default.
+- **Sub-folder of a shared domain** — `https://domain.example/papertick/`. Set
+  `BASE_PATH=/papertick` in `.env` and rebuild (`docker compose up -d --build`):
+  the prefix is compiled into the frontend bundle and route manifest, so a plain
+  restart will not pick it up. The proxy must then pass the prefix through
+  **unchanged** — do not strip it. Each config below shows both shapes.
+
+`FRONTEND_ORIGIN` stays a bare origin in both cases (`https://domain.example`) —
+an `Origin` header never carries a path, and CORS, the cross-origin guard and
+WebAuthn all compare against it.
+
+> **Sub-folder trade-off.** Cookies and passkeys are scoped to a *host*, not a
+> path. On a shared domain the WebAuthn relying party is `domain.example`, so a
+> passkey registered for PaperTick is offered by every app on that domain, and
+> any of them can set cookies PaperTick will receive. PaperTick scopes its own
+> session cookie down to `BASE_PATH`, but that is defense in depth, not isolation.
+> A dedicated hostname is the stronger boundary; use a sub-folder when sharing a
+> certificate or a single public entry point matters more.
 
 ### Caddy
+
+Own hostname:
 
 ```caddyfile
 yourdomain.example {
@@ -350,10 +449,29 @@ yourdomain.example {
 }
 ```
 
-That's the whole config — Caddy provisions and renews the TLS certificate itself
-and sets the forwarding headers above by default.
+Sub-folder — `handle` (not `handle_path`, which would strip the prefix), with a
+matcher that covers `/papertick` itself as well as everything under it:
+
+```caddyfile
+domain.example {
+    @papertick path /papertick /papertick/*
+    handle @papertick {
+        reverse_proxy 127.0.0.1:3000
+    }
+
+    # whatever else this domain serves
+    handle {
+        reverse_proxy 127.0.0.1:8080
+    }
+}
+```
+
+Caddy provisions and renews the TLS certificate itself and sets the forwarding
+headers above by default.
 
 ### nginx
+
+Own hostname:
 
 ```nginx
 server {
@@ -363,7 +481,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name yourdomain.example;
 
     ssl_certificate     /etc/letsencrypt/live/yourdomain.example/fullchain.pem;
@@ -380,13 +499,32 @@ server {
 }
 ```
 
+Sub-folder — inside the existing `443` server block for `domain.example`:
+
+```nginx
+    # ^~ so a regex location elsewhere in the vhost cannot claim these URLs.
+    location ^~ /papertick {
+        # No path on the proxy_pass URL: nginx then forwards the request URI
+        # untouched. Adding a trailing "/" would strip /papertick and every
+        # asset, route and API call underneath it would 404.
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+```
+
 Provision the certificate with `certbot --nginx -d yourdomain.example` (or your
 ACME client of choice) before the `443` block will start.
 
 ### Apache httpd
 
 Requires `proxy`, `proxy_http`, `ssl`, `headers`, and `rewrite` enabled
-(`a2enmod proxy proxy_http ssl headers rewrite` on Debian/Ubuntu):
+(`a2enmod proxy proxy_http ssl headers rewrite` on Debian/Ubuntu).
+
+Own hostname:
 
 ```apacheconf
 <VirtualHost *:80>
@@ -410,17 +548,48 @@ Requires `proxy`, `proxy_http`, `ssl`, `headers`, and `rewrite` enabled
 </VirtualHost>
 ```
 
+Sub-folder — inside the existing `443` vhost for `domain.example`. The prefix
+appears on **both** sides of `ProxyPass`, which is what keeps it on the
+forwarded request:
+
+```apacheconf
+    ProxyPreserveHost On
+    ProxyPass        /papertick http://127.0.0.1:3000/papertick
+    ProxyPassReverse /papertick http://127.0.0.1:3000/papertick
+    RequestHeader set X-Forwarded-Proto "https"
+```
+
 `ProxyPreserveHost` supplies `Host`; `mod_proxy` sets `X-Forwarded-For` on its own.
 
 ### Then
 
-Set `FRONTEND_ORIGIN=https://yourdomain.example` and `COOKIE_SECURE=true` in `.env`
-and rebuild (`docker compose up -d --build`) — both are required for cookies,
-CORS, and WebAuthn to accept the new origin (see
-[Deploying to production](#deploying-to-production)). Agents can then use
-`https://yourdomain.example/api/v1/...` in place of `localhost:8000` in the
+In `.env`, set `COOKIE_SECURE=true`, point `FRONTEND_ORIGIN` at the public origin,
+list the hostname in `ALLOWED_HOSTS`, and add `BASE_PATH` if you went the
+sub-folder route:
+
+```dotenv
+# own hostname
+FRONTEND_ORIGIN=https://yourdomain.example
+ALLOWED_HOSTS=yourdomain.example
+COOKIE_SECURE=true
+BASE_PATH=
+
+# sub-folder
+FRONTEND_ORIGIN=https://domain.example
+ALLOWED_HOSTS=domain.example
+COOKIE_SECURE=true
+BASE_PATH=/papertick
+```
+
+Then rebuild — `docker compose up -d --build`. All four matter before cookies,
+CORS and WebAuthn will accept the new origin (see
+[Deploying to production](#deploying-to-production)), and `BASE_PATH` only takes
+effect through a rebuild.
+
+Agents then use `https://yourdomain.example/api/v1/...` (or
+`https://domain.example/papertick/api/v1/...`) in place of `localhost:3000` in the
 [API examples above](#using-the-api-as-an-agent) — same routes, same responses,
-just through the proxied domain instead of the raw container port.
+just through the proxied origin.
 
 ## Upgrading
 
@@ -442,8 +611,9 @@ docker compose up -d --build
   regret losing:
   `docker compose exec db pg_dump -U papertick papertick > backup.sql`.
 - **Always rebuild the frontend on a real upgrade** (`--build`, not just `up -d`).
-  `BACKEND_URL` and other frontend config are baked in at image build time via
-  Next.js, so a plain restart won't pick up compose or `.env` changes on that side.
+  `BACKEND_URL`, `BASE_PATH` and other frontend config are baked in at image build
+  time via Next.js, so a plain restart won't pick up compose or `.env` changes on
+  that side.
 - **New environment variables** ship with a default in both `.env.example` and
   `docker-compose.yml`, so an upgrade won't break an existing `.env` that's
   missing them — diff the two files after pulling to see what's new and worth
@@ -456,10 +626,15 @@ the four Docker base images, gated behind a test run (`pytest`, `tsc --noEmit`,
 `next build`, then a containerized `/healthz` check) that auto-rolls-back on failure:
 
 ```bash
-./upgrade.sh --check          # see what's outdated, change nothing
+./upgrade.sh --check          # print the full dependency report and stop
 ./upgrade.sh                  # bump within current majors
 ./upgrade.sh --major          # cross major versions too (review changelogs after)
+./upgrade.sh --major --force  # also lift the deliberate version holds (see the script header)
+./upgrade.sh --skip-tests     # skip the test gate, so a broken upgrade is not caught
 ```
+
+Every run, `--check` included, starts by printing the same full report of what is
+outdated; `--check` simply stops there.
 
 **Postgres major-version upgrades need a manual data migration** — a Postgres data
 directory isn't binary-compatible across major versions, so swapping the image tag
@@ -478,7 +653,10 @@ docker compose cp backup.dump db:/tmp/backup.dump
 docker compose exec -T db pg_restore -U papertick -d papertick --no-owner --role=papertick /tmp/backup.dump
 ```
 
-Verify row counts against the old volume before removing it (`docker run --rm -v <old-volume>:/var/lib/postgresql/data postgres:<old-tag> ...` to spin up a throwaway read-only check).
+Verify row counts against the old volume before removing it — `docker run --rm -v
+<old-volume>:<mountpoint> postgres:<old-tag> ...` spins up a throwaway read-only check.
+Mount it where that image expects its data directory: `/var/lib/postgresql/data` up to
+Postgres 17, `/var/lib/postgresql` from 18 on.
 
 ## License
 

@@ -79,7 +79,7 @@ exactly — the full inventory is in [docs/dependencies.md](docs/dependencies.md
 
 | | |
 |---|---|
-| **Docker** | Engine with the Compose v2 plugin — check with `docker compose version`. Rootless Docker is fine; nothing needs a privileged port. |
+| **Docker** | Engine with the Compose v2 plugin — check with `docker compose version`. Rootless Docker is fine; nothing needs a privileged port. Podman works too, with two caveats — see [docs/podman.md](docs/podman.md). |
 | **RAM** | 4 GB comfortably. It will run in 2 GB. |
 | **Disk** | ~1.5 GB of images, a few GB more for Docker's build cache, plus your data (a few hundred MB after years of activity). |
 | **A free port** | 3000 by default, changed with `FRONTEND_PORT`. |
@@ -341,6 +341,7 @@ data are created on backend start by `backend/app/init_db.py`.
 | [Accounting, tax and performance](docs/accounting.md) | Tax lots, IRA mechanics, how returns are computed |
 | [Authentication and security](docs/auth-and-security.md) | Passkeys, MFA, device verification, the security posture |
 | [Reverse proxy](docs/reverse-proxy.md) | Caddy, nginx and Apache configs; sub-folder deployments |
+| [Running on Podman](docs/podman.md) | Rootless Podman, and the two places it differs from Docker |
 | [Upgrading](docs/upgrading.md) | `upgrade.sh`, dependency policy, Postgres major versions |
 | [Dependencies](docs/dependencies.md) | Every pinned package and image, and what it is for |
 

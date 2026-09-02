@@ -150,7 +150,12 @@ services:
     expose:
       - "8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      # CMD-SHELL, not the CMD array form: Podman re-splits an exec-form argument
+      # on whitespace, so `python -c "import urllib.request; ..."` reaches Python
+      # as a bare `import` and the container never becomes healthy — which stops
+      # worker, beat and frontend from starting at all. Handing the whole thing
+      # to /bin/sh keeps the quoting intact on both runtimes.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)\""]
       interval: 10s
       timeout: 5s
       retries: 12

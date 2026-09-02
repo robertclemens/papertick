@@ -141,7 +141,7 @@ Five settings in `.env`, then rebuild:
 ENV=production                             # email verification, no anonymous API docs
 COOKIE_SECURE=true                         # you are behind TLS
 FRONTEND_ORIGIN=https://papertick.example  # scheme + host, never a path
-ALLOWED_HOSTS=papertick.example            # reject a spoofed Host header
+ALLOWED_HOSTS=backend,127.0.0.1            # Host values the BACKEND sees, not your domain
 SMTP_HOST=smtp.example.com                 # + SMTP_USER / SMTP_PASSWORD / SMTP_FROM
 ```
 
@@ -255,7 +255,8 @@ git clone https://github.com/robertclemens/papertick.git /srv/papertick
 scp papertick.dump .env newhost:/srv/papertick/
 
 # 4. on the NEW server — adjust .env if the address changed:
-#    FRONTEND_ORIGIN, ALLOWED_HOSTS, FRONTEND_PORT, BASE_PATH
+#    FRONTEND_ORIGIN, FRONTEND_PORT, BASE_PATH
+#    (ALLOWED_HOSTS is internal — it does not change with the public address)
 cd /srv/papertick
 
 # 5. restore into the empty database, then start everything

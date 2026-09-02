@@ -55,10 +55,11 @@ account calls for one.**
   process that reaches the network cannot clear a lockout or set a fill price.
 - API keys stored as SHA-256 hashes; plaintext shown exactly once; scoped; revocable.
 - The backend port is never published: only `frontend` is reachable from the host,
-  so there is no route around TLS or the ingress. `ALLOWED_HOSTS` rejects a spoofed
-  `Host`, and `X-Forwarded-For` is believed only from CIDRs you list in
-  `TRUSTED_PROXY_CIDRS` (nothing, by default), so a caller cannot choose its own
-  rate-limit bucket.
+  so there is no route around TLS or the ingress. `ALLOWED_HOSTS` pins the backend
+  to the Host values it legitimately sees (`backend`, `127.0.0.1`) — a spoofed
+  *public* Host is rejected by the reverse proxy, which matches one hostname.
+  `X-Forwarded-For` is believed only from CIDRs you list in `TRUSTED_PROXY_CIDRS`
+  (nothing, by default), so a caller cannot choose its own rate-limit bucket.
 - Strict Pydantic validation with bounds on every money/shares input; request bodies
   capped at 8 MiB before parsing; only US-listed USD symbols the market-data source
   can confirm become tradable. Security headers and a strict CSP on both services;

@@ -174,24 +174,34 @@ forwarded request:
 ## Then update .env
 
 In `.env`, set `COOKIE_SECURE=true`, point `FRONTEND_ORIGIN` at the public origin,
-list the hostname in `ALLOWED_HOSTS`, and add `BASE_PATH` if you went the
-sub-folder route:
+and add `BASE_PATH` if you went the sub-folder route:
 
 ```dotenv
 # own hostname
 FRONTEND_ORIGIN=https://yourdomain.example
-ALLOWED_HOSTS=yourdomain.example
 COOKIE_SECURE=true
 BASE_PATH=
 
 # sub-folder
 FRONTEND_ORIGIN=https://domain.example
-ALLOWED_HOSTS=domain.example
 COOKIE_SECURE=true
 BASE_PATH=/papertick
 ```
 
-Then rebuild — `docker compose up -d --build`. All four matter before cookies,
+`ALLOWED_HOSTS` does **not** take your public hostname, and does not change when
+the public address does. The frontend proxies `/api` to the backend with
+`changeOrigin`, which rewrites `Host` to the upstream's own name — so the backend
+only ever sees `Host: backend:8000` from that rewrite, or `127.0.0.1:8000` from
+its own healthcheck. Put your public hostname there and every API call comes back
+`400 Invalid host header`, which the UI surfaces as `Request failed (400)`. Leave
+it at `backend,127.0.0.1`.
+
+Rejecting a spoofed *public* Host is the proxy's job, and each config above
+already does it: they match one hostname and answer anything else with a 404.
+That only holds while the proxy is the sole way in, which is why the published
+frontend port should be bound to loopback.
+
+Then rebuild — `docker compose up -d --build`. All three matter before cookies,
 CORS and WebAuthn will accept the new origin (see
 [Deploying to production](../README.md#deploying-to-production)), and `BASE_PATH` only takes
 effect through a rebuild.

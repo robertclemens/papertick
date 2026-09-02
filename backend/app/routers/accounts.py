@@ -2,7 +2,7 @@ from datetime import date
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.db import for_update, get_db
@@ -14,6 +14,7 @@ from app.models import (
     AssetClass,
     CashFlowKind,
     Contribution,
+    Conversion,
     CostBasisMethod,
     CostBasisOverride,
 )
@@ -27,11 +28,18 @@ from app.schemas import (
     CostBasisConfigOut,
     CostBasisOverrideOut,
     CostBasisUpdateIn,
+    ConversionIn,
+    ConversionOut,
+    ConversionPreviewOut,
+    ConversionResultOut,
     DepositIn,
     IrsStatusOut,
+    WithdrawalLayerOut,
+    WithdrawalPlanOut,
     WithdrawIn,
 )
-from app.services import irs
+from app.services import conversions, irs, trading
+from app.services import ira as ira_svc
 
 router = APIRouter(tags=["accounts"])
 
@@ -138,8 +146,6 @@ def update_account(account_id: str, data: AccountSettingsIn,
     account = owned_account(account_id, principal, db)
     if data.name is not None:
         account.name = data.name
-    if data.allow_external_funding is not None:
-        account.allow_external_funding = data.allow_external_funding
     db.commit()
     return _account_out(db, account)
 
@@ -154,7 +160,14 @@ def deposit(account_id: str, data: DepositIn, principal: Principal = Depends(req
     and defaults to the prior tax year while it's still open (before Tax Day)
     unless `tax_year` is given. TAXABLE deposits and ROLLOVER-kind deposits
     skip limit checks entirely; a regular contribution into a Rollover IRA is
-    rejected outright."""
+    rejected outright.
+
+    `nondeductible` marks a Traditional/Rollover IRA deposit as after-tax money.
+    It adds to that account's basis, so a later conversion or withdrawal is
+    partly tax-free under the Form 8606 pro-rata rule. Whether a contribution is
+    actually deductible depends on income and workplace-plan coverage that this
+    platform cannot see, so it is declared rather than inferred — exactly as it
+    is on the real form."""
     account = owned_account(account_id, principal, db)
     kind = CashFlowKind(data.kind)
     # Every lock is taken *before* the limit is checked. The check and the
@@ -169,9 +182,26 @@ def deposit(account_id: str, data: DepositIn, principal: Principal = Depends(req
     tax_year, warnings, irs_after = irs.validate_deposit(
         db, principal.user, locked, data.amount, data.tax_year, kind
     )
+    nondeductible = bool(data.nondeductible)
+    if nondeductible and locked.account_type not in ira_svc.PRE_TAX_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=("Only a Traditional or Rollover IRA can hold after-tax basis. Roth "
+                    "money is already after-tax, and a taxable account has no basis to "
+                    "track."),
+        )
+
     locked.settlement_balance = Decimal(locked.settlement_balance) + data.amount
+    if nondeductible:
+        locked.after_tax_basis = Decimal(locked.after_tax_basis or 0) + data.amount
+        warnings.append(
+            "Recorded as a nondeductible contribution. It becomes after-tax basis, so a "
+            "future conversion or withdrawal is partly tax-free — prorated across every "
+            "Traditional and Rollover IRA you hold, not just this one."
+        )
     contribution = Contribution(
-        account_id=locked.id, tax_year=tax_year, amount=data.amount, kind=kind
+        account_id=locked.id, tax_year=tax_year, amount=data.amount, kind=kind,
+        nondeductible=nondeductible,
     )
     db.add(contribution)
     db.commit()
@@ -189,9 +219,14 @@ def withdraw(account_id: str, data: WithdrawIn, principal: Principal = Depends(r
     """Removes cash from the account's settlement fund. The amount available to
     withdraw excludes cash committed to open buy orders or held as short-put
     collateral, even though the full balance is what actually gets debited;
-    requests over that available amount are blocked with a 422. Withdrawing
-    from an IRA before age 59½ (per the user's date of birth) adds a warning
-    about early-withdrawal taxes and penalty, but is not blocked."""
+    requests over that available amount are blocked with a 422.
+
+    An IRA withdrawal is costed rather than merely flagged. Roth money comes out
+    in the order the IRS prescribes — regular contributions, then conversions
+    oldest-first, then earnings — and Traditional money comes out pro-rata
+    against after-tax basis. The returned `plan` carries the layers, the ordinary
+    income, and the 10% additional tax where it applies. Nothing is blocked; set
+    `penalty_exception` to attest that one of the IRS exceptions applies."""
     from app.services.trading import buying_power
 
     account = owned_account(account_id, principal, db)
@@ -212,25 +247,126 @@ def withdraw(account_id: str, data: WithdrawIn, principal: Principal = Depends(r
             ),
         )
     warnings: list[str] = []
-    if locked.account_type != AccountType.TAXABLE:
-        age = (date.today() - principal.user.date_of_birth).days / 365.25
-        if age < 59.5:
-            warnings.append(
-                "Early IRA withdrawal before age 59½ — in a real account this could "
-                "trigger taxes and a 10% penalty."
-            )
+    plan = None
+    today = date.today()
+    if locked.account_type == AccountType.ROTH_IRA:
+        plan = ira_svc.plan_roth_withdrawal(
+            db, principal.user, principal.scenario_id, data.amount, today,
+            data.penalty_exception,
+        )
+    elif locked.account_type in ira_svc.PRE_TAX_TYPES:
+        plan = ira_svc.plan_traditional_withdrawal(
+            db, principal.user, principal.scenario_id, data.amount, today,
+            data.penalty_exception,
+        )
+
     locked.settlement_balance = balance - data.amount  # full balance, not the withdrawable subset
     contribution = Contribution(
-        account_id=locked.id, tax_year=None, amount=-data.amount, kind=CashFlowKind.WITHDRAWAL
+        account_id=locked.id, tax_year=None, amount=-data.amount,
+        kind=CashFlowKind.WITHDRAWAL, penalty_exception=data.penalty_exception,
     )
     db.add(contribution)
+
+    if plan is not None:
+        # a Roth distribution eats into the conversions it drew on, and a
+        # Traditional one consumes the basis it came out against; recorded here
+        # so the next distribution's ordering starts from the truth
+        for conv, used_taxable, used_nontaxable in plan.conversion_draws:
+            conv.taxable_remaining = Decimal(conv.taxable_remaining) - used_taxable
+            conv.nontaxable_remaining = Decimal(conv.nontaxable_remaining) - used_nontaxable
+        if plan.basis_used:
+            ira_svc.consume_basis(db, principal.user, principal.scenario_id, plan.basis_used)
+        warnings.extend(plan.notes)
+
     db.commit()
     return CashFlowResultOut(
         account=_account_out(db, locked),
         contribution=ContributionOut.model_validate(contribution),
         warnings=warnings,
         irs=None,
+        plan=WithdrawalPlanOut(
+            gross=plan.gross,
+            layers=[WithdrawalLayerOut(label=l.label, amount=l.amount,
+                                       taxable=l.taxable, penalty=l.penalty)
+                    for l in plan.layers],
+            taxable_income=plan.taxable_income,
+            penalty=plan.penalty,
+            qualified=plan.qualified,
+            notes=plan.notes,
+        ) if plan is not None else None,
     )
+
+
+@router.post("/accounts/{account_id}/convert/preview", response_model=ConversionPreviewOut)
+def preview_conversion(account_id: str, data: ConversionIn,
+                       principal: Principal = Depends(require_read),
+                       db: Session = Depends(get_db)) -> ConversionPreviewOut:
+    """What converting from this account into a Roth IRA would cost, without
+    doing it. Shows the pro-rata split into taxable and after-tax dollars, the
+    combined basis it was computed against, and the five-year clock the
+    conversion would start."""
+    source = owned_account(account_id, principal, db)
+    dest = owned_account(data.to_account_id, principal, db)
+    return ConversionPreviewOut(**conversions.preview(
+        db, principal.user, principal.scenario_id, source, dest,
+        amount=data.amount, ticker=data.ticker, shares=data.shares, on=data.as_of,
+    ))
+
+
+@router.post("/accounts/{account_id}/convert", response_model=ConversionResultOut,
+             status_code=201)
+def convert_to_roth(account_id: str, data: ConversionIn,
+                    principal: Principal = Depends(require_trade),
+                    db: Session = Depends(get_db)) -> ConversionResultOut:
+    """Convert cash or shares from a Traditional/Rollover IRA into a Roth IRA.
+
+    Irreversible: recharacterising a conversion was eliminated for 2018 and
+    later. The taxable portion is ordinary income for the conversion year, and
+    the conversion starts its own five-year clock. There is no annual limit and
+    no income cap, so this never touches contribution room.
+
+    In kind (`ticker` + `shares`) moves the shares themselves, valued at the
+    conversion date — they arrive in the Roth with a fresh lot at that price."""
+    source = owned_account(account_id, principal, db)
+    dest = owned_account(data.to_account_id, principal, db)
+
+    if data.as_of is not None and not trading.backdating_allowed(db, source):
+        raise HTTPException(status_code=422, detail=trading.BACKDATE_REFUSED)
+
+    # both sides move money, so both are locked before anything is computed
+    for aid in sorted({source.id, dest.id}):
+        db.execute(for_update(select(Account).where(Account.id == aid)))
+    if source.account_type in irs.IRA_LIKE:
+        irs.lock_contribution_scope(db, principal.user, principal.scenario_id)
+
+    plan = conversions.preview(db, principal.user, principal.scenario_id, source, dest,
+                               amount=data.amount, ticker=data.ticker,
+                               shares=data.shares, on=data.as_of)
+    conversion = conversions.execute(db, principal.user, principal.scenario_id, source, dest,
+                                     amount=data.amount, ticker=data.ticker,
+                                     shares=data.shares, on=data.as_of)
+    db.commit()
+    return ConversionResultOut(
+        conversion=ConversionOut.model_validate(conversion),
+        from_account=_account_out(db, source),
+        to_account=_account_out(db, dest),
+        notes=plan["notes"],
+    )
+
+
+@router.get("/accounts/{account_id}/conversions", response_model=list[ConversionOut])
+def list_conversions(account_id: str, principal: Principal = Depends(require_read),
+                     db: Session = Depends(get_db)):
+    """Conversions into or out of this account, oldest first — each with its own
+    five-year clock and how much of it is still inside the Roth."""
+    account = owned_account(account_id, principal, db)
+    rows = db.execute(
+        select(Conversion)
+        .where(or_(Conversion.from_account_id == account.id,
+                   Conversion.to_account_id == account.id))
+        .order_by(Conversion.conversion_date, Conversion.created_at)
+    ).scalars()
+    return [ConversionOut.model_validate(r) for r in rows]
 
 
 @router.get("/accounts/{account_id}/contributions", response_model=list[ContributionOut])

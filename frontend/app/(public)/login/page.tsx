@@ -11,16 +11,19 @@ import { ErrorText, InfoText } from "@/components/ui";
  *
  *  1. email
  *  2. password — or a passkey, which replaces the password entirely
- *  3. authenticator code, whenever the account has one enrolled. Both the
- *     password and the passkey path go through it: a passkey proves possession
- *     of a registered authenticator, which is not a substitute for the second
- *     factor the user deliberately turned on.
+ *  3. a second step, when the account calls for one:
+ *       - authenticator code, when TOTP is enrolled (password path only — a
+ *         passkey ceremony with user verification is already two factors, and
+ *         chaining a phishable code behind an unphishable credential buys
+ *         nothing);
+ *       - a code emailed to the account, in production, when the account has
+ *         neither a passkey nor TOTP and this browser is not recognised.
  *
  *  The email step deliberately does NOT ask the server which methods an
  *  account has: an endpoint that answers "this address has a passkey" is an
  *  account-enumeration oracle. Passkeys here are discoverable credentials, so
  *  the browser can offer them without the server naming them first. */
-type Step = "email" | "credential" | "mfa";
+type Step = "email" | "credential" | "mfa" | "device";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -28,6 +31,7 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [mfaToken, setMfaToken] = useState<string | null>(null);
+  const [deviceToken, setDeviceToken] = useState<string | null>(null);
   const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -42,6 +46,7 @@ export default function LoginPage() {
     setPassword("");
     setCode("");
     setMfaToken(null);
+    setDeviceToken(null);
     setError("");
     setShowResend(false);
   }
@@ -50,15 +55,9 @@ export default function LoginPage() {
     setError("");
     setBusy(true);
     try {
-      const res = await signInWithPasskey();
-      if (res.mfa_required) {
-        // The account has an authenticator enrolled, so the passkey is the
-        // first factor here, not both.
-        setMfaToken(res.mfa_token);
-        setStep("mfa");
-        setBusy(false);
-        return;
-      }
+      // A passkey signs in outright: the ceremony runs with user verification
+      // required, so it is already possession + biometric/PIN.
+      await signInWithPasskey();
       router.push("/");
       router.refresh();
     } catch (err) {
@@ -93,14 +92,27 @@ export default function LoginPage() {
     try {
       if (step === "mfa") {
         await api("/auth/login/mfa", { method: "POST", body: { mfa_token: mfaToken, code } });
-      } else {
-        const res = await api<{ mfa_required: boolean; mfa_token: string | null }>("/auth/login", {
+      } else if (step === "device") {
+        await api("/auth/login/device", {
           method: "POST",
-          body: { email, password },
+          body: { device_token: deviceToken, code },
         });
+      } else {
+        const res = await api<{
+          mfa_required: boolean;
+          mfa_token: string | null;
+          device_verification_required: boolean;
+          device_token: string | null;
+        }>("/auth/login", { method: "POST", body: { email, password } });
         if (res.mfa_required) {
           setMfaToken(res.mfa_token);
           setStep("mfa");
+          setBusy(false);
+          return;
+        }
+        if (res.device_verification_required) {
+          setDeviceToken(res.device_token);
+          setStep("device");
           setBusy(false);
           return;
         }
@@ -118,6 +130,7 @@ export default function LoginPage() {
     email: "Sign in to your simulation desk",
     credential: "Confirm it's you",
     mfa: "Two-factor verification",
+    device: "New device",
   }[step];
 
   return (
@@ -179,6 +192,24 @@ export default function LoginPage() {
             </div>
           )}
 
+          {step === "device" && (
+            <div>
+              <label className="label" htmlFor="device-code">Emailed code</label>
+              <input ref={focusRef} id="device-code" inputMode="numeric" pattern="[0-9]*"
+                     maxLength={8} required autoComplete="one-time-code"
+                     className="input text-center text-lg tracking-[0.4em]"
+                     value={code} onChange={(e) => setCode(e.target.value)} />
+              <p className="mt-2 text-xs text-slate-500">
+                We don&apos;t recognise this browser, so we emailed a 6-digit code to{" "}
+                <span className="text-slate-400">{email}</span>. We&apos;ll remember this
+                device after you enter it.
+              </p>
+              <p className="mt-2 text-xs text-slate-500">
+                Adding a passkey or an authenticator app replaces this step entirely.
+              </p>
+            </div>
+          )}
+
           <ErrorText>{error}</ErrorText>
           {notice && <InfoText>{notice}</InfoText>}
           {showResend && (
@@ -191,7 +222,7 @@ export default function LoginPage() {
             {busy
               ? "Signing in…"
               : step === "email" ? "Continue"
-              : step === "mfa" ? "Verify code"
+              : step === "mfa" || step === "device" ? "Verify code"
               : "Sign in"}
           </button>
 

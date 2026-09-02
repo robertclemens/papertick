@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.deps import Principal, require_manage, require_read
-from app.models import Account, Scenario, utcnow
+from app.models import Account, Scenario, Transaction, utcnow
 from app.rate_limit import rate_limiter
 from app.schemas import (
     DeletedScenarioOut,
@@ -23,6 +23,15 @@ router = APIRouter(prefix="/scenarios", tags=["scenarios"])
 
 def _out(db: Session, principal: Principal, scenario: Scenario) -> ScenarioOut:
     accounts = db.query(Account).filter(Account.scenario_id == scenario.id).count()
+    # counted rather than inferred from the toggle: turning past-dated fills
+    # back off does not remove the ones already in the book, and it is the
+    # fills, not the setting, that a reader of these numbers needs to know about
+    backdated = (
+        db.query(Transaction)
+        .join(Account, Account.id == Transaction.account_id)
+        .filter(Account.scenario_id == scenario.id, Transaction.backdated.is_(True))
+        .count()
+    )
     return ScenarioOut(
         id=scenario.id,
         name=scenario.name,
@@ -32,6 +41,8 @@ def _out(db: Session, principal: Principal, scenario: Scenario) -> ScenarioOut:
         account_count=accounts,
         is_default=principal.user.default_scenario_id == scenario.id,
         is_active=principal.scenario_id == scenario.id,
+        allow_backdated=scenario.allow_backdated,
+        backdated_fills=backdated,
         created_at=scenario.created_at,
     )
 
@@ -47,10 +58,16 @@ def list_scenarios(principal: Principal = Depends(require_read),
 @router.post("", response_model=ScenarioOut, status_code=201)
 def create_scenario(data: ScenarioCreateIn, principal: Principal = Depends(require_manage),
                     db: Session = Depends(get_db)) -> ScenarioOut:
-    """Start a new track. `copy_from_id` brings the balances and holdings across
-    priced at today's market; trades, dividends and auto-invest rules are not
-    copied, so the new scenario starts from the position rather than the past."""
-    scenario = svc.create(db, principal.user, data.name, data.description, data.copy_from_id)
+    """Start a new track.
+
+    With `copy_from_id`, `copy_mode` decides how much comes across:
+    `position` (the default) brings only the balances and holdings, re-priced
+    at today's market, so the new scenario starts flat and measures itself from
+    day one; `full` duplicates the source exactly — orders, transactions, tax
+    lots, dividends, contributions and auto-invest rules — so returns and
+    history carry over."""
+    scenario = svc.create(db, principal.user, data.name, data.description,
+                          data.copy_from_id, data.copy_mode)
     db.commit()
     return _out(db, principal, scenario)
 
@@ -72,9 +89,13 @@ def import_scenario(data: ScenarioImportIn, principal: Principal = Depends(requi
 def update_scenario(scenario_id: str, data: ScenarioUpdateIn,
                     principal: Principal = Depends(require_manage),
                     db: Session = Depends(get_db)) -> ScenarioOut:
-    """Rename, redescribe, or set a scenario as the default. Setting
-    `is_default` does not switch this request's active scenario — that is
-    chosen separately via the `X-Scenario-Id` header."""
+    """Rename, redescribe, set a scenario as the default, or turn past-dated
+    fills on or off for it. Setting `is_default` does not switch this request's
+    active scenario — that is chosen separately via the `X-Scenario-Id` header.
+
+    `allow_backdated` is opt-in per scenario because a past-dated order is
+    placed knowing the outcome. Turning it back off stops new ones; it does not
+    un-mark the fills already made, and it never will."""
     scenario = svc.owned(db, principal.user, scenario_id)
     if data.name is not None:
         scenario.name = svc._unique_name(db, principal.user, data.name.strip(),
@@ -83,6 +104,8 @@ def update_scenario(scenario_id: str, data: ScenarioUpdateIn,
         scenario.description = data.description or None
     if data.is_default:
         principal.user.default_scenario_id = scenario.id
+    if data.allow_backdated is not None:
+        scenario.allow_backdated = data.allow_backdated
     db.commit()
     return _out(db, principal, scenario)
 

@@ -6,10 +6,22 @@ account, so scoping a request is one predicate on `Account.scenario_id`.
 Statements are the exception — they aggregate across accounts, so they carry
 the scenario id themselves.
 
-Copying takes the *position*, not the past: balances and holdings come across,
-priced at today's market so the new track starts flat, and the trade history,
-dividends and auto-invest rules are deliberately left behind. A scenario is
-"what happens from here", not a second copy of what already happened.
+Copying comes in two shapes, because both are legitimate questions to ask of
+a portfolio:
+
+  position (default)
+      Balances and holdings only, re-priced at today's market. Each copied
+      account opens with one deposit and one buy per holding, so the new track
+      starts flat and measures itself from day one. "What happens from here?"
+
+  full
+      An exact duplicate — every order, transaction, tax lot, dividend,
+      contribution and auto-invest rule, with fresh ids. Returns and history
+      carry over intact. "What if I had done something different?"
+
+`full` is the same data an export/import round trip produces, minus the file:
+statements are the only omission either way, because they re-render from the
+ledger rather than being source data.
 """
 
 import logging
@@ -17,7 +29,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app import security
@@ -26,6 +38,7 @@ from app.models import (
     Account,
     CashFlowKind,
     Contribution,
+    Conversion,
     CostBasisOverride,
     Dividend,
     OptionPosition,
@@ -39,6 +52,7 @@ from app.models import (
     QuantityType,
     RecurringRule,
     Scenario,
+    SplitApplication,
     Statement,
     TaxLot,
     Transaction,
@@ -57,6 +71,7 @@ EXPORT_VERSION = 1
 ACCOUNT_CHILDREN = (
     Transaction, TaxLot, Position, Dividend, Contribution,
     RecurringRule, CostBasisOverride, OptionTransaction, OptionPosition, Order,
+    SplitApplication,
 )
 
 
@@ -126,8 +141,33 @@ def _unique_name(db: Session, user: User, wanted: str, exclude_id: str | None = 
     return f"{wanted} ({n})"
 
 
+FIRST_SCENARIO_NAME = "Scenario 1"
+
+
+def ensure_default(db: Session, user: User) -> Scenario:
+    """Give a user their first scenario, if they have none.
+
+    An account is meaningless without one to hang off, so this runs the moment
+    a user comes into existence rather than at the next backend start — the
+    startup backfill only covers accounts that predate scenarios entirely.
+    Idempotent: an existing scenario is adopted as the default instead.
+    """
+    existing = db.execute(
+        select(Scenario)
+        .where(Scenario.user_id == user.id, Scenario.deleted_at.is_(None))
+        .order_by(Scenario.sort_order, Scenario.created_at)
+    ).scalars().first()
+    if existing is None:
+        existing = Scenario(user_id=user.id, name=FIRST_SCENARIO_NAME, sort_order=0)
+        db.add(existing)
+        db.flush()
+    if user.default_scenario_id is None:
+        user.default_scenario_id = existing.id
+    return existing
+
+
 def create(db: Session, user: User, name: str, description: str | None = None,
-           copy_from_id: str | None = None) -> Scenario:
+           copy_from_id: str | None = None, copy_mode: str = "position") -> Scenario:
     existing = list_for(db, user)
     if len(existing) >= MAX_SCENARIOS_PER_USER:
         raise HTTPException(
@@ -145,7 +185,10 @@ def create(db: Session, user: User, name: str, description: str | None = None,
     db.add(scenario)
     db.flush()
     if source is not None:
-        _copy_positions(db, user, source, scenario)
+        if copy_mode == "full":
+            _copy_full(db, user, source, scenario)
+        else:
+            _copy_positions(db, user, source, scenario)
     return scenario
 
 
@@ -182,7 +225,6 @@ def _copy_positions(db: Session, user: User, source: Scenario, target: Scenario)
             settlement_accrued=ZERO,
             settlement_accrued_through=as_of,
             cost_basis_method=account.cost_basis_method,
-            allow_external_funding=account.allow_external_funding,
             sort_order=account.sort_order,
         )
         db.add(clone)
@@ -240,12 +282,88 @@ def _copy_positions(db: Session, user: User, source: Scenario, target: Scenario)
     log.info("scenario %s copied holdings from %s", target.id, source.id)
 
 
+def _copy_full(db: Session, user: User, source: Scenario, target: Scenario) -> None:
+    """Duplicate the whole track, history included.
+
+    Same row set and same id-remapping as an export/import round trip, done in
+    process: rows are inserted carrying their original cross-references — which
+    are still valid, since the source rows are right there in the same
+    database — and a second pass rewrites them through the completed map. That
+    ordering matters because an order can name a recurring rule that is
+    inserted after it.
+    """
+    accounts = list(db.execute(
+        select(Account).where(Account.scenario_id == source.id)
+        .order_by(Account.sort_order, Account.created_at)
+    ).scalars())
+    account_ids = [a.id for a in accounts]
+    id_map: dict[str, str] = {}
+
+    for account in accounts:
+        data = {
+            c.name: getattr(account, c.name)
+            for c in Account.__table__.columns
+            if c.name not in ("id", "user_id", "scenario_id")
+        }
+        clone = Account(**data, user_id=user.id, scenario_id=target.id)
+        db.add(clone)
+        db.flush()
+        id_map[account.id] = clone.id
+
+    inserted: list[tuple[object, object]] = []
+    if account_ids:
+        for _key, model in CHILD_TABLES:
+            rows = db.execute(
+                select(model).where(model.account_id.in_(account_ids))
+            ).scalars().all()
+            for row in rows:
+                data = {
+                    c.name: getattr(row, c.name)
+                    for c in model.__table__.columns if c.name != "id"
+                }
+                data["account_id"] = id_map[row.account_id]
+                clone = model(**data)
+                db.add(clone)
+                db.flush()
+                id_map[row.id] = clone.id
+                inserted.append((clone, row))
+
+    # two-account rows go in once every account they join has been mapped
+    if account_ids:
+        for _key, model, cols in ACCOUNT_PAIR_TABLES:
+            for row in db.execute(select(model).where(or_(*[
+                getattr(model, c).in_(account_ids) for c in cols
+            ]))).scalars().all():
+                data = {c.name: getattr(row, c.name)
+                        for c in model.__table__.columns if c.name != "id"}
+                if any(data.get(c) not in id_map for c in cols):
+                    continue           # joins an account outside this scenario
+                for c in cols:
+                    data[c] = id_map[data[c]]
+                db.add(model(**data))
+
+    for clone, original in inserted:
+        for column in CROSS_REFS:
+            value = getattr(original, column, None)
+            if value:
+                setattr(clone, column, id_map.get(value))
+
+    target.allow_backdated = source.allow_backdated
+    db.flush()
+    log.info("scenario %s fully copied from %s (%d accounts, %d rows)",
+             target.id, source.id, len(accounts), len(inserted))
+
+
 def wipe(db: Session, scenario: Scenario) -> None:
     """Delete every row belonging to a scenario, leaving the scenario itself."""
     account_ids = [a.id for a in db.execute(
         select(Account).where(Account.scenario_id == scenario.id)
     ).scalars()]
     if account_ids:
+        for _key, model, cols in ACCOUNT_PAIR_TABLES:
+            db.query(model).filter(or_(*[
+                getattr(model, c).in_(account_ids) for c in cols
+            ])).delete(synchronize_session=False)
         for model in ACCOUNT_CHILDREN:
             db.query(model).filter(model.account_id.in_(account_ids)).delete(
                 synchronize_session=False)
@@ -375,6 +493,7 @@ def export_scenario(db: Session, user: User, scenario: Scenario) -> dict:
         "scenario": {
             "name": scenario.name,
             "description": scenario.description,
+            "allow_backdated": scenario.allow_backdated,
         },
         "accounts": [_dump(a, skip=("user_id", "scenario_id")) for a in accounts],
         "orders": [_dump(o) for o in rows(Order)],
@@ -385,13 +504,32 @@ def export_scenario(db: Session, user: User, scenario: Scenario) -> dict:
         "dividends": [_dump(d) for d in rows(Dividend)],
         "recurring_rules": [_dump(r) for r in rows(RecurringRule)],
         "cost_basis_overrides": [_dump(o) for o in rows(CostBasisOverride)],
+        # carried so a copy does not re-apply splits its lots already reflect
+        "split_applications": [_dump(a) for a in rows(SplitApplication)],
         "option_positions": [_dump(p) for p in rows(OptionPosition)],
         "option_transactions": [_dump(t) for t in rows(OptionTransaction)],
+        # carried so a restored Roth still knows which of its money was
+        # converted, when, and how much of it was already taxed
+        "conversions": [
+            _dump(c) for c in (db.execute(select(Conversion).where(or_(
+                Conversion.from_account_id.in_(ids),
+                Conversion.to_account_id.in_(ids),
+            ))).scalars() if ids else [])
+        ],
     }
     # Detached: the signature covers the body but is not part of it, so
     # verification re-signs exactly what was signed.
     return {**body, "signature": security.sign_export(body)}
 
+
+#: Tables keyed by *two* account columns instead of one. A conversion joins the
+#: account money left with the account it arrived in, so neither column alone
+#: identifies it and the generic `account_id` machinery cannot carry it. Left
+#: out of an export, a restored scenario would forget its conversion history —
+#: and Roth ordering would then treat already-taxed money as earnings.
+ACCOUNT_PAIR_TABLES = (
+    ("conversions", Conversion, ("from_account_id", "to_account_id")),
+)
 
 CHILD_TABLES = (
     ("orders", Order),
@@ -402,6 +540,7 @@ CHILD_TABLES = (
     ("dividends", Dividend),
     ("recurring_rules", RecurringRule),
     ("cost_basis_overrides", CostBasisOverride),
+    ("split_applications", SplitApplication),
     ("option_positions", OptionPosition),
     ("option_transactions", OptionTransaction),
 )
@@ -551,7 +690,7 @@ def import_scenario(db: Session, user: User, payload: dict,
     if len(payload.get("accounts") or []) > MAX_ACCOUNTS:
         raise HTTPException(status_code=422,
                             detail=f"Export holds more than {MAX_ACCOUNTS} accounts")
-    for key, _model in CHILD_TABLES:
+    for key, _model in CHILD_TABLES + tuple((k, m) for k, m, _ in ACCOUNT_PAIR_TABLES):
         if len(payload.get(key) or []) > MAX_ROWS_PER_TABLE:
             raise HTTPException(
                 status_code=422,
@@ -567,6 +706,8 @@ def import_scenario(db: Session, user: User, payload: dict,
     else:
         scenario = create(db, user, wanted,
                           (payload.get("scenario") or {}).get("description"))
+    # absent in files written before this was a per-scenario setting
+    scenario.allow_backdated = bool((payload.get("scenario") or {}).get("allow_backdated"))
 
     # New ids throughout: an export may be imported alongside the scenario it
     # came from, so primary keys cannot be reused. Rows go in first with their
@@ -607,6 +748,19 @@ def import_scenario(db: Session, user: User, payload: dict,
             if old_id:
                 id_map[old_id] = row.id
             inserted.append((row, payload_row))
+
+    for key, model, cols in ACCOUNT_PAIR_TABLES:
+        for payload_row in payload.get(key) or []:
+            if not isinstance(payload_row, dict):
+                raise HTTPException(status_code=422,
+                                    detail=f"Invalid export: {key} row is not an object")
+            data = _coerce(model, payload_row)
+            data.pop("id", None)
+            mapped = {c: id_map.get(data.get(c)) for c in cols}
+            if any(v is None for v in mapped.values()):
+                continue               # joins an account the file omitted
+            data.update(mapped)
+            db.add(model(**data))
 
     for row, payload_row in inserted:
         for column in CROSS_REFS:

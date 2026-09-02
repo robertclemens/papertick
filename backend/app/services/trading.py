@@ -18,6 +18,7 @@ UPDATE row locks; fills are all-or-nothing. ENFORCE_MARKET_HOURS=false turns
 off the market-clock emulation (everything fills instantly at the last price).
 """
 
+import hashlib
 import json
 import logging
 from datetime import date, datetime, timedelta, timezone
@@ -78,8 +79,46 @@ def q_price(v: Decimal) -> Decimal:
     return v.quantize(MICRO, ROUND_HALF_UP)
 
 
-def _slipped(price: Decimal, side: OrderSide) -> Decimal:
-    bps = Decimal(get_settings().slippage_bps)
+def _slippage_bps(seed: str | None) -> Decimal:
+    """Basis points of slippage for one fill.
+
+    `fixed` returns SLIPPAGE_BPS flat. `variable` draws from a triangular
+    distribution over [MIN, MODE, MAX]: most fills land near the typical
+    spread, the adverse tail is longer than the favourable one, and a negative
+    draw represents the price improvement real retail flow does receive. A
+    single static value is the one thing real fills never look like.
+
+    The draw is seeded from the order id rather than a PRNG, so it is stable:
+    re-running the same backtest, or replaying a missed recurring buy after an
+    outage, reproduces the fill instead of inventing a new one. With no seed
+    (a preview) the mode is returned, so a quote shown before the trade is the
+    expected cost rather than a number that moves on refresh.
+    """
+    s = get_settings()
+    mode = Decimal(s.slippage_bps)
+    if s.slippage_model == "fixed" or seed is None:
+        return mode
+    low, high = Decimal(s.slippage_bps_min), Decimal(s.slippage_bps_max)
+    if high <= low:
+        return mode
+    mode = min(max(mode, low), high)
+
+    # sha256 -> u in (0,1), the same deterministic-uniform trick the synthetic
+    # provider uses, so nothing here depends on process-local RNG state
+    digest = hashlib.sha256(f"slip|{seed}".encode()).digest()
+    u = Decimal(int.from_bytes(digest[:8], "big") + 1) / Decimal(2**64 + 2)
+
+    span, lower = high - low, mode - low
+    pivot = lower / span
+    if u < pivot:
+        draw = low + (span * lower * u).sqrt()
+    else:
+        draw = high - (span * (high - mode) * (Decimal(1) - u)).sqrt()
+    return draw
+
+
+def _slipped(price: Decimal, side: OrderSide, seed: str | None = None) -> Decimal:
+    bps = _slippage_bps(seed)
     factor = Decimal(1) + (bps / Decimal(10000)) * (1 if side == OrderSide.BUY else -1)
     return q_price(price * factor)
 
@@ -190,6 +229,11 @@ def account_out(db: Session, account: Account):
     out.settlement_yield = settlement.current_yield()
     out.settlement_accrued = q_money(Decimal(account.settlement_accrued or 0))
     out.contribution_statuses = irs.contribution_statuses(db, account)
+    out.backdated_fills = db.execute(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.account_id == account.id, Transaction.backdated.is_(True)
+        )
+    ).scalar_one()
     return out
 
 
@@ -198,14 +242,18 @@ class FundingError(Exception):
 
 
 def fundable_amount(db: Session, account: Account) -> Decimal:
-    """How much external cash may still be pulled into this account. Taxable
-    accounts are unconstrained; IRAs are capped by the room left across every
-    open contribution bucket — which, between Jan 1 and Tax Day, is the prior
-    year plus the current one."""
+    """How much external cash may still be pulled into this account.
+
+    Every purchase is paid for out of the settlement fund, and a purchase the
+    fund cannot cover pulls in what it is short — the platform has no view of
+    what you hold elsewhere, so it takes the order as a statement that the
+    money exists. Taxable accounts are therefore unconstrained. The two limits
+    that remain are legal ones the IRS imposes, not preferences: an IRA is
+    capped by the room left across every open contribution bucket (between
+    Jan 1 and Tax Day that is the prior year plus the current one), and a
+    Rollover IRA accepts no regular contribution at all."""
     from app.services import irs
 
-    if not account.allow_external_funding:
-        return ZERO
     if account.account_type == AccountType.TAXABLE:
         return Decimal("10000000")
     if account.account_type == AccountType.ROLLOVER_IRA:
@@ -220,19 +268,15 @@ def fundable_amount(db: Session, account: Account) -> Decimal:
 
 
 def auto_fund(db: Session, account: Account, shortfall: Decimal, memo: str) -> Decimal:
-    """Pull `shortfall` from the linked external bank into `account`, recording
-    it as a cash transfer (and, in an IRA, as a contribution for the current
-    tax year so it counts against the limit). Raises FundingError when the
-    transfer is not permitted. Caller commits."""
+    """Pull `shortfall` from an external bank into `account`, recording it as a
+    cash transfer (and, in an IRA, as a contribution for the current tax year
+    so it counts against the limit). Raises FundingError only where the IRS
+    forbids the transfer. Caller commits."""
     from app.models import CashFlowKind, Contribution
     from app.services import irs
 
     if shortfall <= 0:
         return ZERO
-    if not account.allow_external_funding:
-        raise FundingError(
-            "External funding is turned off for this account — deposit cash first"
-        )
     if account.account_type == AccountType.ROLLOVER_IRA:
         raise FundingError(
             "A Rollover IRA takes rollover money only, so a bank transfer cannot "
@@ -418,9 +462,39 @@ def require_asset(db: Session, ticker: str) -> Asset:
     )
 
 
+BACKDATE_REFUSED = (
+    "Past-dated trades are off for this scenario. They rewrite periods that "
+    "already have statements and let an order be placed knowing the outcome, so "
+    "they are opt-in per scenario — turn them on in the scenario's settings, or "
+    "switch to a scenario that allows them. Everything a scenario produces while "
+    "they are on is marked as containing past-dated fills."
+)
+
+
+def backdating_allowed(db: Session, account: Account) -> bool:
+    """Whether this account's scenario accepts past-dated ("as of") fills.
+
+    A scenario is exactly the right place to test a hypothesis whose outcome is
+    already known — provided the scenario opted in and everything it produces
+    says so. That is why this is a per-scenario setting rather than one switch
+    for the whole deployment.
+    """
+    from app.models import Scenario
+
+    scenario = db.get(Scenario, account.scenario_id)
+    return bool(scenario and scenario.allow_backdated)
+
+
 def place_order(db: Session, account: Account, data: OrderCreateIn, source: OrderSource,
                 now: datetime | None = None,
                 exchange_to: str | None = None) -> tuple[Order, Transaction | None]:
+    # This price is about to become a permanent ledger row, so the provider it
+    # comes from must have been verified on the right adjustment basis
+    # recently enough to trust. The common case is a cached verdict: one
+    # 0.13ms Redis read. Only an expired one pays to re-measure.
+    from app.services.convention import ensure_fresh_for_write
+
+    ensure_fresh_for_write()
     reject_settlement_ticker(data.ticker)
     asset = require_asset(db, data.ticker)
     now = now or utcnow()
@@ -431,15 +505,8 @@ def place_order(db: Session, account: Account, data: OrderCreateIn, source: Orde
     if data.as_of is not None and data.scheduled_for is not None:
         raise HTTPException(status_code=422, detail="Use either as_of (backtest) or scheduled_for, not both")
     if data.as_of is not None:
-        if not get_settings().allow_backdated_trades:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Past-dated trades are disabled. They rewrite periods that already "
-                    "have statements and let an order be placed knowing the outcome — "
-                    "set ALLOW_BACKDATED_TRADES=true to enable them for market testing."
-                ),
-            )
+        if not backdating_allowed(db, account):
+            raise HTTPException(status_code=422, detail=BACKDATE_REFUSED)
         if data.order_type != OrderType.MARKET:
             raise HTTPException(status_code=422, detail="Historical (as_of) orders must be MARKET orders")
         if data.as_of >= today:
@@ -569,7 +636,7 @@ def place_order(db: Session, account: Account, data: OrderCreateIn, source: Orde
         quote = market_data.quote(order.ticker)
     except MarketDataError as exc:
         return _reject(db, order, f"Market data unavailable: {exc}")
-    txn = execute_fill(db, order, _slipped(quote.price, order.side), today)
+    txn = execute_fill(db, order, _slipped(quote.price, order.side, order.id), today)
     db.commit()
     return order, txn
 
@@ -723,6 +790,15 @@ def expire_due_orders(db: Session, now: datetime | None = None) -> int:
         db.commit()
         log.info("expired %d resting order(s)", len(due))
     return len(due)
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    """Stored timestamps are UTC, but not every backend hands them back with a
+    tzinfo (SQLite has no tz type). A naive one here would raise mid-comparison
+    and take the whole scheduled-order sweep down with it."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
 
 
 def _close_or_none(ticker: str, d: date) -> Decimal | None:
@@ -916,6 +992,7 @@ def execute_fill(db: Session, order: Order, price: Decimal, as_of: date) -> Tran
         realized_st=realized_st,
         realized_lt=realized_lt,
         as_of=as_of,
+        backdated=order.as_of is not None,
     )
     db.add(txn)
     order.status = OrderStatus.FILLED
@@ -953,6 +1030,15 @@ def run_due_scheduled_orders(db: Session, now: datetime | None = None) -> int:
             skip_locked=True,
         )
     ).scalars().all()
+    if due:
+        from app.services.convention import ensure_fresh_for_write
+
+        ensure_fresh_for_write()
+        # These accounts are about to spend cash, so their dividend credits
+        # have to be in the balance first. No due orders means no call.
+        from app.services.dividends import ensure_current
+
+        ensure_current(db, [o.account_id for o in due])
     processed = 0
     for order in due:
         asset = db.get(Asset, order.ticker)
@@ -964,12 +1050,41 @@ def run_due_scheduled_orders(db: Session, now: datetime | None = None) -> int:
             except MarketDataError:
                 price = None
             if price is None:
-                if now < cal.mf_fill_time(order.nav_date) + timedelta(hours=30):
+                settings = get_settings()
+                fill_time = cal.mf_fill_time(order.nav_date)
+                if now < fill_time + timedelta(hours=settings.nav_poll_give_up_hours):
                     continue  # NAV not published yet — retry next tick
                 price = _close_or_none(order.ticker, order.nav_date)
                 if price is None:
+                    # Our chain has failed to price this for the whole window.
+                    # Before throwing away a trade the user asked for, find out
+                    # which of two very different things is true: the fund has
+                    # not published a NAV, or our providers cannot see one that
+                    # exists. Only an independent source can tell them apart,
+                    # and the answer decides whether rejecting is right.
+                    from app.services.oracle import reference_close
+
+                    confirmed = (
+                        reference_close(order.ticker, order.nav_date)
+                        if settings.nav_hold_max_days > 0 else None
+                    )
+                    hard_cap = fill_time + timedelta(days=settings.nav_hold_max_days)
+                    if confirmed is not None and now < hard_cap:
+                        log.error(
+                            "order %s: %s NAV for %s exists (independently "
+                            "confirmed at %s) but no configured provider will "
+                            "return it — holding the order; check the market "
+                            "data providers",
+                            order.id, order.ticker, order.nav_date, confirmed)
+                        continue
                     order.status = OrderStatus.REJECTED
-                    order.reject_reason = f"No NAV available for {order.ticker} on {order.nav_date}"
+                    order.reject_reason = (
+                        f"No NAV published for {order.ticker} on {order.nav_date} "
+                        f"(confirmed against an independent source)"
+                        if confirmed is None else
+                        f"NAV for {order.ticker} on {order.nav_date} exists but no "
+                        f"provider returned it within {settings.nav_hold_max_days} days"
+                    )
                     processed += 1
                     continue
             execute_fill(db, order, price, order.nav_date)
@@ -989,11 +1104,23 @@ def run_due_scheduled_orders(db: Session, now: datetime | None = None) -> int:
         try:
             quote = market_data.quote(order.ticker)
         except MarketDataError as exc:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = f"Market data unavailable at scheduled time: {exc}"
-            processed += 1
+            # No synthetic substitute exists, by design: filling here would
+            # write an invented price into the ledger permanently. Hold the
+            # order and retry — the user asked for this trade, and a provider
+            # blip is not a reason to lose it or to fake it.
+            give_up = timedelta(hours=get_settings().market_data_give_up_hours)
+            due_at = _aware(order.scheduled_for)
+            if due_at is not None and now > due_at + give_up:
+                order.status = OrderStatus.REJECTED
+                order.reject_reason = (
+                    f"Market data unavailable for {order.ticker} for over "
+                    f"{get_settings().market_data_give_up_hours}h: {exc}"
+                )
+                processed += 1
+            else:
+                log.warning("order %s held: market data unavailable (%s)", order.id, exc)
             continue
-        execute_fill(db, order, _slipped(quote.price, order.side), now.date())
+        execute_fill(db, order, _slipped(quote.price, order.side, order.id), now.date())
         processed += 1
     db.commit()
     return processed
@@ -1102,11 +1229,8 @@ def preview_exchange(db: Session, account: Account, data):
     require_asset(db, data.from_ticker)
     require_asset(db, data.to_ticker)
 
-    if data.as_of is not None and not get_settings().allow_backdated_trades:
-        raise HTTPException(
-            status_code=422,
-            detail="Past-dated trades are disabled (ALLOW_BACKDATED_TRADES)",
-        )
+    if data.as_of is not None and not backdating_allowed(db, account):
+        raise HTTPException(status_code=422, detail=BACKDATE_REFUSED)
     as_of = data.as_of or date.today()
     taxable = account.account_type == AccountType.TAXABLE
     price = _exchange_price(db, data.from_ticker, as_of, OrderSide.SELL)

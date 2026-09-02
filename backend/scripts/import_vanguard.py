@@ -35,6 +35,32 @@ Vanguard's export does not say which tax year a contribution was designated to,
 so IRA contributions are attributed to the year of the trade date. A January-to-
 April contribution designated to the prior year will land a year late; nothing
 else depends on it.
+
+Purchases the balance cannot cover
+----------------------------------
+Vanguard settles a trade whether or not the cash has landed and carries the
+shortfall as a debit, so the replay reaches purchases it cannot pay for. The
+debit never appears in the activity file as a row of its own — it shows up only
+as a deposit that is partly swept into the settlement fund:
+
+    3/11  VMFXX  Sweep out        $1.5700
+    3/11  VOO    Buy           -$249.9900     <- settles against $1.60
+    3/13  VMFXX  Sweep in      -$251.6100     <- $500 arrived, $251.61 swept
+    3/13         Funds Received $500.0000        the other $248.39 cleared it
+
+Treating that as an external deposit double-counts the money, because the real
+$500.00 is imported in full two days later. So a short purchase is carried as
+credit and repaid out of the next cash in, which is what the sweep amounts show
+Vanguard doing. Sweep rows themselves stay ignored: here the settlement fund IS
+the cash balance, so replaying them would move the same dollars twice.
+
+Only a debit still outstanding at the end of the file means cash is genuinely
+absent — a purchase from before the export window, or a cash-in row whose type
+this parser does not recognise. That inferred figure is a floor and never a
+fact: it is by construction whatever leaves the balance at zero. Each one is
+printed at the end. Look the date up in the statement and state it instead:
+
+    --fund-brokerage 2026-03-10=250.00     (repeatable, per bucket)
 """
 
 import argparse
@@ -64,6 +90,7 @@ from app.models import (
     OrderType,
     Position,
     QuantityType,
+    Scenario,
     TaxLot,
     Transaction,
     User,
@@ -74,6 +101,7 @@ ZERO = Decimal("0")
 SETTLEMENT_TICKER = "VMFXX"
 IMPORT_MEMO = "Imported from Vanguard activity export"
 FUNDING_MEMO = "Funding inferred from Vanguard activity export"
+MANUAL_MEMO = "Deposit supplied with --fund (absent from the export)"
 
 # Symbols that appear in these exports, with the metadata the app shows.
 ASSETS = {
@@ -227,6 +255,31 @@ def read_rows(path: str) -> tuple[list[Row], list[str]]:
     return rows, skipped
 
 
+def funding_rows(specs: list[str]) -> list[Row]:
+    """Build cash-in rows for deposits the export does not contain.
+
+    `--fund 2026-03-10=250.00` states a deposit as fact, where leaving it out
+    makes the importer guess one from the shortfall. The date is the day the
+    deposit was initiated, which is also what it settles on here: the point of
+    supplying it by hand is that the file has no settlement date to use.
+    """
+    out: list[Row] = []
+    for spec in specs:
+        day_text, _, amount_text = spec.partition("=")
+        day = parse_date(day_text.strip())
+        amount = parse_number(amount_text)
+        if day is None or amount is None or amount <= 0:
+            raise SystemExit(f"--fund expects DATE=AMOUNT, got {spec!r}")
+        row = Row()
+        row.day = row.settles = day
+        row.symbol, row.raw_type = "", "--fund"
+        row.kind, row.rank = "cash_in", ORDER_CASH_IN
+        row.shares = row.price = None
+        row.amount = amount
+        out.append(row)
+    return out
+
+
 def ensure_assets(db) -> None:
     for ticker, (name, klass, er, category, region) in ASSETS.items():
         asset = db.get(Asset, ticker)
@@ -240,14 +293,37 @@ def ensure_assets(db) -> None:
     db.flush()
 
 
-def ensure_account(db, user: User, bucket: str) -> Account:
-    account_type, default_name = BUCKETS[bucket]
-    account = db.execute(
-        select(Account).where(Account.user_id == user.id, Account.account_type == account_type)
+def resolve_scenario(db, user: User, name: str | None) -> Scenario | None:
+    """A scenario is a separate track of the same buckets, so an account type
+    no longer identifies an account on its own."""
+    if name is None:
+        return None
+    scenario = db.execute(
+        select(Scenario).where(Scenario.user_id == user.id, Scenario.name == name)
     ).scalar_one_or_none()
+    if scenario is None:
+        names = db.execute(select(Scenario.name).where(Scenario.user_id == user.id)).scalars()
+        raise SystemExit(f"No scenario named {name!r}. Try one of: {', '.join(sorted(names))}")
+    return scenario
+
+
+def ensure_account(db, user: User, bucket: str, scenario: Scenario | None) -> Account:
+    account_type, default_name = BUCKETS[bucket]
+    query = select(Account).where(Account.user_id == user.id,
+                                  Account.account_type == account_type)
+    query = query.where(Account.scenario_id == scenario.id if scenario is not None
+                        else Account.scenario_id.is_(None))
+    found = list(db.execute(query).scalars())
+    if len(found) > 1:
+        raise SystemExit(
+            f"{len(found)} {default_name} accounts match — name the one to import into: "
+            + ", ".join(f"{a.name!r} ({a.id})" for a in found)
+        )
+    account = found[0] if found else None
     if account is None:
         account = Account(user_id=user.id, account_type=account_type, name=default_name,
                           settlement_balance=ZERO, allow_external_funding=False,
+                          scenario_id=scenario.id if scenario is not None else None,
                           sort_order=list(BUCKETS).index(bucket))
         db.add(account)
         db.flush()
@@ -276,12 +352,24 @@ def import_account(db, user: User, account: Account, rows: list[Row],
     """Replay one file into one account, in date order. Returns a summary."""
     is_ira = account.account_type != AccountType.TAXABLE
     stats = defaultdict(int)
-    inferred_funding = ZERO
+    inferred: list[tuple[date, str, Decimal]] = []
     rejects: list[str] = []
+    credit = ZERO          # settlement debit outstanding against this account
+
+    def repay() -> None:
+        """Cash on hand pays down an outstanding debit before it can be spent,
+        which is what the sweep amounts in the file show Vanguard doing."""
+        nonlocal credit
+        if credit > 0 and Decimal(account.settlement_balance) > 0:
+            paid = min(credit, Decimal(account.settlement_balance))
+            account.settlement_balance = Decimal(account.settlement_balance) - paid
+            credit -= paid
 
     for row in rows:
+        repay()
         if row.kind == "cash_in":
-            _deposit(db, account, row.settles, row.amount, is_ira, IMPORT_MEMO)
+            memo = MANUAL_MEMO if row.raw_type == "--fund" else IMPORT_MEMO
+            _deposit(db, account, row.settles, row.amount, is_ira, memo)
             stats["deposits"] += 1
             continue
 
@@ -311,14 +399,39 @@ def import_account(db, user: User, account: Account, rows: list[Row],
 
         side = OrderSide.BUY if row.kind == "buy" else OrderSide.SELL
         if side == OrderSide.BUY:
-            need = q_money(row.shares * q_price(row.price))
-            short = need - Decimal(account.settlement_balance)
+            short = q_money(row.shares * q_price(row.price)) - Decimal(account.settlement_balance)
             if short > 0:
-                # the legacy platform reported purchases without a funding row
-                _deposit(db, account, row.settles, short, is_ira, FUNDING_MEMO)
-                inferred_funding += short
-                stats["inferred_deposits"] += 1
+                # A purchase the balance cannot cover is a settlement DEBIT,
+                # not a missing deposit. Vanguard settles the trade and carries
+                # the shortfall until cash arrives; the debit is invisible in
+                # the activity file except as a deposit that is only partly
+                # swept into the settlement fund. On 2026-03-11 a $249.99 VOO
+                # purchase settled against $1.60, and the $500.00 received on
+                # 03-13 swept in as $251.61 — the missing $248.39 cleared the
+                # debit.
+                #
+                # Booking that as an external deposit is what corrupts the
+                # ledger: the money arrives a second time when the real deposit
+                # is imported in full. So carry it as credit, repay it from the
+                # next cash in, and let the file balance itself.
+                account.settlement_balance = Decimal(account.settlement_balance) + short
+                credit += short
+                stats["credit_extended"] += 1
         _fill(db, account, row, side, stats, rejects)
+
+    repay()          # the last row may have been the deposit that clears it
+
+    # A debit still outstanding once the file is exhausted was never repaid by
+    # anything in it, so this is the one case where cash is genuinely absent.
+    # The deposit is booked and immediately repays the debit: those dollars
+    # have already been spent on the purchase that ran short, so crediting the
+    # balance a second time would be the very double-count this avoids.
+    if credit > 0:
+        last = rows[-1].settles if rows else date.today()
+        inferred.append((last, "", credit))
+        stats["inferred_deposits"] += 1
+        _deposit(db, account, last, credit, is_ira, FUNDING_MEMO)
+        repay()
 
     db.flush()
     positions = {
@@ -329,7 +442,7 @@ def import_account(db, user: User, account: Account, rows: list[Row],
         "stats": dict(stats),
         "cash": Decimal(account.settlement_balance),
         "positions": positions,
-        "inferred_funding": inferred_funding,
+        "inferred": inferred,
         "rejects": rejects,
     }
 
@@ -408,6 +521,13 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true", help="commit (default is a dry run)")
     ap.add_argument("--replace", action="store_true",
                     help="clear existing activity in those accounts first")
+    ap.add_argument("--scenario", help="name of the scenario holding these accounts "
+                                       "(omit for accounts outside any scenario)")
+    for bucket in BUCKETS:
+        ap.add_argument(f"--fund-{bucket}", action="append", default=[],
+                        metavar="DATE=AMOUNT",
+                        help=f"a {bucket} deposit the export omits, e.g. "
+                             "2026-03-10=250.00 (repeatable)")
     args = ap.parse_args()
 
     files = {b: getattr(args, b) for b in BUCKETS if getattr(args, b)}
@@ -420,12 +540,17 @@ def main() -> int:
         print(f"No user {args.email!r}", file=sys.stderr)
         return 1
 
+    scenario = resolve_scenario(db, user, args.scenario)
     ensure_assets(db)
-    print(f"{'APPLY' if args.apply else 'DRY RUN'} — {user.email}\n")
+    print(f"{'APPLY' if args.apply else 'DRY RUN'} — {user.email}"
+          f"{f' — scenario {scenario.name!r}' if scenario else ''}\n")
     grand_total = ZERO
     for bucket, path in files.items():
         rows, skipped = read_rows(path)
-        account = ensure_account(db, user, bucket)
+        extra = funding_rows(getattr(args, f"fund_{bucket}"))
+        if extra:
+            rows = sorted(rows + extra, key=lambda r: (r.settles, r.rank, r.day))
+        account = ensure_account(db, user, bucket, scenario)
         if args.replace:
             wipe(db, account)
         result = import_account(db, user, account, rows, not args.apply)
@@ -434,18 +559,34 @@ def main() -> int:
         print(f"  parsed {len(rows)} rows, skipped {len(skipped)}")
         print(f"  {result['stats']}")
         print(f"  settlement fund: ${result['cash']:,.2f}")
-        if result["inferred_funding"]:
-            print(f"  funding inferred for legacy buys: ${result['inferred_funding']:,.2f}")
+        if result["stats"].get("credit_extended"):
+            print(f"  settlement credit extended and repaid on "
+                  f"{result['stats']['credit_extended']} purchase(s)")
+        if result["inferred"]:
+            total = sum(a for _, _, a in result["inferred"])
+            print(f"  !! ${total:,.2f} of cash is MISSING from this file and was "
+                  f"INFERRED, not read:")
+            for day, ticker, amount in result["inferred"]:
+                print(f"       {day}  {ticker or '(cash)':<8} ${amount:>12,.2f}  "
+                      f"<- a floor, not the real deposit")
+            print(f"     A debit left unpaid by the whole file means a cash-in row is "
+                  f"absent.\n     This figure is whatever leaves the balance at exactly "
+                  f"$0.00, so a real\n     deposit is under-booked by its remainder. Find "
+                  f"it in the statement and\n     re-run with --fund-{bucket} DATE=AMOUNT.")
         for ticker, shares in sorted(result["positions"].items()):
             print(f"    {ticker:<8} {shares:>16,.4f} shares")
         for line in result["rejects"][:10]:
             print(f"  REJECTED {line}")
         if len(result["rejects"]) > 10:
             print(f"  ... and {len(result['rejects']) - 10} more rejections")
-        for line in skipped[:3]:
-            print(f"  skipped: {line}")
-        if len(skipped) > 3:
-            print(f"  ... and {len(skipped) - 3} more skipped rows")
+        # An unrecognised row is how a deposit silently disappears, so these
+        # are printed in full; the settlement-fund internals are just noise.
+        unknown = [ln for ln in skipped if "UNRECOGNIZED" in ln]
+        for line in unknown:
+            print(f"  !! skipped: {line}")
+        routine = len(skipped) - len(unknown)
+        if routine:
+            print(f"  skipped {routine} settlement-fund internal row(s)")
         print()
         grand_total += result["cash"]
 

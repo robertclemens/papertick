@@ -12,6 +12,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Iterable
 
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -28,6 +29,9 @@ from app.models import (
     utcnow,
 )
 from app.schemas import (
+    MonthEventOut,
+    MonthPerformanceOut,
+    MonthlyPerformanceOut,
     PerformanceOut,
     PerformancePointOut,
     PortfolioSummaryOut,
@@ -122,6 +126,13 @@ def summary(db: Session, user: User, account_id: str | None = None,
             )
         ).all())
     options_value = options_positions_value(db, ids)
+    backdated_fills = 0
+    if ids:
+        backdated_fills = db.execute(
+            select(func.count()).select_from(Transaction).where(
+                Transaction.account_id.in_(ids), Transaction.backdated.is_(True)
+            )
+        ).scalar_one()
     invested = sum((p.market_value for p in positions), ZERO)
     basis = sum((p.cost_basis for p in positions), ZERO)
     unreal = sum((p.unrealized_gains for p in positions), ZERO)
@@ -176,6 +187,7 @@ def summary(db: Session, user: User, account_id: str | None = None,
         realized_gains_sheltered=realized_sheltered.quantize(CENT),
         total_dividends=dividends_total.quantize(CENT),
         total_fees=fees.quantize(CENT),
+        backdated_fills=backdated_fills,
         accounts=[_account_out(db, a) for a in accounts],
     )
 
@@ -227,12 +239,45 @@ def account_returns(db: Session, user: User, range_key: str,
 
 # ------------------------------------------------------------- performance
 
-def performance(db: Session, user: User, account_id: str | None, range_key: str,
-                scenario_id: str | None = None) -> PerformanceOut:
-    accounts = _user_accounts(db, user, account_id, scenario_id)
+class ReplayDay:
+    """One valued day of a replayed ledger.
+
+    `flow` and `income` cover everything since the previous valued day, not just
+    this calendar date: markets are shut at weekends but deposits and dividends
+    are not, so those land on the next day the portfolio can actually be priced.
+    Keeping them attributed that way is what makes the identity
+
+        ending = beginning + flow + income + market movement
+
+    hold exactly across any span of days you care to sum over.
+    """
+
+    __slots__ = ("date", "value", "flow", "income")
+
+    def __init__(self, date: date, value: Decimal, flow: Decimal, income: Decimal):
+        self.date = date
+        self.value = value
+        self.flow = flow
+        self.income = income
+
+
+def _replay(db: Session, accounts: list[Account]) -> list[ReplayDay]:
+    """Rebuild the daily value of a set of accounts from first activity to today.
+
+    This is the single source of truth for every performance figure in the
+    product — the dashboard chart, the windowed summary, and the month-by-month
+    table all consume it. They used to be free to compute a beginning balance
+    each in their own way, which is exactly how a table stops tying to the chart
+    printed above it.
+
+    External flows are separated from income on purpose. A deposit is not
+    performance; a dividend is. Netting them (which the windowed view can get
+    away with, since it only reports their sum) would make it impossible to
+    split a month into "market gain/loss" and "income returns".
+    """
     ids = [a.id for a in accounts]
     if not ids:
-        return PerformanceOut(series=[])
+        return []
 
     txns = list(db.execute(
         select(Transaction)
@@ -262,11 +307,7 @@ def performance(db: Session, user: User, account_id: str | None, range_key: str,
         default=None,
     )
     if events_start is None:
-        return PerformanceOut(series=[])
-
-    days_back = RANGE_DAYS.get(range_key, RANGE_DAYS["1y"])
-    range_start = events_start if days_back is None else max(events_start, today - timedelta(days=days_back))
-    range_start = max(range_start, EPOCH)
+        return []
 
     tickers = sorted({t.ticker for t in txns})
     price_maps: dict[str, dict[date, Decimal]] = {}
@@ -295,7 +336,8 @@ def performance(db: Session, user: User, account_id: str | None, range_key: str,
     # external flow — on the day it was actually executed. That keeps the
     # replayed series free of phantom negative cash, and TWR/IRR treat both
     # sides as flows rather than performance.
-    flow_by_day: dict[date, Decimal] = defaultdict(Decimal)   # external flows
+    flow_by_day: dict[date, Decimal] = defaultdict(Decimal)    # external flows
+    income_by_day: dict[date, Decimal] = defaultdict(Decimal)  # dividends, premium
     cash_by_day: dict[date, Decimal] = defaultdict(Decimal)
     shares_by_day: dict[date, list[tuple[str, Decimal]]] = defaultdict(list)
 
@@ -305,21 +347,25 @@ def performance(db: Session, user: User, account_id: str | None, range_key: str,
         cash_by_day[d0] += amt
         flow_by_day[d0] += amt
 
-    # dividends and option premiums/settlements are income (performance), not external flows
+    # Dividends and option premiums/settlements are performance, not external
+    # flows. Only dividends (which includes settlement-fund interest, written as
+    # a Dividend row) count as *income*: an option premium is a trading result,
+    # so it stays in cash and lands in market gain/loss by residual.
     for dv in dividends:
         cash_by_day[dv.event_date] += Decimal(dv.amount)
+        income_by_day[dv.event_date] += Decimal(dv.amount)
     for ot in option_txns:
         cash_by_day[ot.as_of] += Decimal(ot.cash_effect)
 
     for t in txns:
-        s = Decimal(t.shares_filled)
+        s_ = Decimal(t.shares_filled)
         gross = Decimal(t.gross_amount)
         fee = Decimal(t.fees)
         exec_d = t.executed_at.date()
         if t.side == OrderSide.BUY:
-            cash_delta, share_delta = -(gross + fee), s
+            cash_delta, share_delta = -(gross + fee), s_
         else:
-            cash_delta, share_delta = gross - fee, -s
+            cash_delta, share_delta = gross - fee, -s_
         shares_by_day[t.as_of].append((t.ticker, share_delta))
         if t.as_of < exec_d:  # backtest
             cash_by_day[exec_d] += cash_delta
@@ -341,8 +387,45 @@ def performance(db: Session, user: User, account_id: str | None, range_key: str,
     cash = ZERO
     shares: dict[str, Decimal] = defaultdict(Decimal)
     last_px: dict[str, Decimal] = {}
+    days: list[ReplayDay] = []
+    # flows and income landing on non-valued (weekend) days roll forward
+    pending_flow = ZERO
+    pending_income = ZERO
+
+    d = events_start
+    while d <= today:
+        cash += cash_by_day.get(d, ZERO)
+        for tk, ds in shares_by_day.get(d, ()):
+            shares[tk] += ds
+        pending_flow += flow_by_day.get(d, ZERO)
+        pending_income += income_by_day.get(d, ZERO)
+
+        if d.weekday() < 5 or d == today:
+            value = cash + sum((sh * px(tk, d, last_px) for tk, sh in shares.items() if sh), ZERO)
+            if d == today and option_txns:
+                from app.services.options import positions_value as _opt_value
+                value += _opt_value(db, ids)
+            days.append(ReplayDay(d, value, pending_flow, pending_income))
+            pending_flow = ZERO
+            pending_income = ZERO
+        d += timedelta(days=1)
+
+    return days
+
+
+def performance(db: Session, user: User, account_id: str | None, range_key: str,
+                scenario_id: str | None = None) -> PerformanceOut:
+    accounts = _user_accounts(db, user, account_id, scenario_id)
+    days = _replay(db, accounts)
+    if not days:
+        return PerformanceOut(series=[])
+
+    today = utcnow().date()
+    days_back = RANGE_DAYS.get(range_key, RANGE_DAYS["1y"])
+    range_start = days[0].date if days_back is None else max(days[0].date, today - timedelta(days=days_back))
+    range_start = max(range_start, EPOCH)
+
     series: list[PerformancePointOut] = []
-    pending_flow = ZERO  # flows landing on non-valued (weekend) days roll forward
     twr_product = 1.0
     twr_started = False
     prev_value: Decimal | None = None
@@ -352,39 +435,27 @@ def performance(db: Session, user: User, account_id: str | None, range_key: str,
     beginning_balance = ZERO       # value carried into the range
     period_flows: list[tuple[date, Decimal]] = []
     period_flow_total = ZERO
+    period_income = ZERO
 
-    d = events_start
-    while d <= today:
-        cash += cash_by_day.get(d, ZERO)
-        for tk, ds in shares_by_day.get(d, ()):
-            shares[tk] += ds
-        day_flow = flow_by_day.get(d, ZERO)
-        pending_flow += day_flow
-        if d >= range_start and day_flow:
-            period_flows.append((d, day_flow))
-            period_flow_total += day_flow
-
-        if d.weekday() < 5 or d == today:
-            value = cash + sum((sh * px(tk, d, last_px) for tk, sh in shares.items() if sh), ZERO)
-            if d == today and option_txns:
-                from app.services.options import positions_value as _opt_value
-                value += _opt_value(db, ids)
-            if d < range_start:
-                beginning_balance = value  # last valuation before the window opens
-            elif prev_value is not None and prev_value > CENT:
-                twr_product *= float((value - pending_flow) / prev_value)
+    for day in days:
+        if day.date >= range_start and day.flow:
+            period_flows.append((day.date, day.flow))
+            period_flow_total += day.flow
+        if day.date < range_start:
+            beginning_balance = day.value   # last valuation before the window opens
+        else:
+            if prev_value is not None and prev_value > CENT:
+                twr_product *= float((day.value - day.flow) / prev_value)
                 twr_started = True
-            prev_value = value if value > CENT else None
-            pending_flow = ZERO
-            if d >= range_start:
-                series.append(PerformancePointOut(
-                    date=d,
-                    value=value.quantize(CENT),
-                    # rebased to the window: the gap between this line and the
-                    # value line IS the period's investment return
-                    net_deposits=(beginning_balance + period_flow_total).quantize(CENT),
-                ))
-        d += timedelta(days=1)
+            period_income += day.income
+            series.append(PerformancePointOut(
+                date=day.date,
+                value=day.value.quantize(CENT),
+                # rebased to the window: the gap between this line and the
+                # value line IS the period's investment return
+                net_deposits=(beginning_balance + period_flow_total).quantize(CENT),
+            ))
+        prev_value = day.value if day.value > CENT else None
 
     ending_balance = series[-1].value if series else ZERO
     investment_returns = ending_balance - beginning_balance - period_flow_total
@@ -410,10 +481,6 @@ def performance(db: Session, user: User, account_id: str | None, range_key: str,
                                 period_start, today)
         rate_of_return = dietz * 100 if dietz is not None else None
 
-    period_dividends = sum(
-        (Decimal(dv.amount) for dv in dividends if dv.event_date >= range_start), ZERO
-    )
-
     return PerformanceOut(
         series=series,
         twr_pct=twr_pct,
@@ -424,10 +491,179 @@ def performance(db: Session, user: User, account_id: str | None, range_key: str,
         ending_balance=ending_balance.quantize(CENT),
         net_cash_flow=period_flow_total.quantize(CENT),
         investment_returns=investment_returns.quantize(CENT),
-        dividends=period_dividends.quantize(CENT),
+        dividends=period_income.quantize(CENT),
         period_start=period_start,
         period_end=series[-1].date if series else None,
     )
+
+
+def _flow_label(kind: str, amount: Decimal) -> str:
+    """A conversion writes a signed pair, so the sign says which leg this is."""
+    if kind == "CONVERSION":
+        return "Roth conversion in" if amount > 0 else "Roth conversion out"
+    return {"CONTRIBUTION": "Deposit", "ROLLOVER": "Rollover in",
+            "WITHDRAWAL": "Withdrawal"}.get(kind, kind.title())
+
+
+def _month_key(d: date) -> str:
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def monthly_performance(db: Session, user: User, account_id: str | None,
+                        months: int | None, scenario_id: str | None = None,
+                        account_type: AccountType | None = None) -> MonthlyPerformanceOut:
+    """Month-by-month performance, newest first.
+
+    One row per calendar month, each satisfying
+
+        ending = beginning + flows + market + income
+
+    by construction rather than by rounding luck — every figure comes from the
+    same daily replay that draws the chart, so the table and the line above it
+    can never disagree.
+
+    `cumulative` is the running sum of personal returns since **inception**, not
+    since the top of the displayed window: it answers "how much of this balance
+    did the market give me", which does not change because the reader asked to
+    see fewer months. That means the replay always runs from first activity no
+    matter how short the window.
+    """
+    accounts = _user_accounts(db, user, account_id, scenario_id)
+    if account_type is not None:
+        accounts = [a for a in accounts if a.account_type == account_type]
+    days = _replay(db, accounts)
+    if not days:
+        return MonthlyPerformanceOut(months=[])
+
+    ids = [a.id for a in accounts]
+    backdated_by_month: dict[str, int] = defaultdict(int)
+    if ids:
+        for (as_of,) in db.execute(
+            select(Transaction.as_of).where(
+                Transaction.account_id.in_(ids), Transaction.backdated.is_(True)
+            )
+        ):
+            backdated_by_month[_month_key(as_of)] += 1
+
+    # Walk forward accumulating per month, carrying the previous month's close
+    # as this month's opening value. The very first month opens at whatever the
+    # account was worth on its first valued day minus that day's own flow —
+    # otherwise the opening deposit would look like a market gain.
+    rows: list[MonthPerformanceOut] = []
+    cumulative = ZERO
+    prev_close: Decimal | None = None
+    current: dict | None = None
+
+    def close_month(entry: dict) -> None:
+        nonlocal cumulative
+        # Round first, then derive market gain as the residual of the rounded
+        # figures. Quantizing each component independently and hoping they add
+        # up leaves rows off by a cent, and a performance table that does not
+        # visibly balance is one nobody trusts twice.
+        beginning = entry["beginning"].quantize(CENT)
+        ending = entry["ending"].quantize(CENT)
+        flows = entry["flows"].quantize(CENT)
+        income = entry["income"].quantize(CENT)
+        market = ending - beginning - flows - income
+        personal = market + income
+        cumulative += personal
+        rows.append(MonthPerformanceOut(
+            month=entry["month"],
+            beginning_balance=beginning,
+            net_cash_flow=flows,
+            market_gain=market,
+            income=income,
+            personal_return=personal,
+            cumulative_return=cumulative,
+            ending_balance=ending,
+            backdated_fills=backdated_by_month.get(entry["month"], 0),
+        ))
+
+    for day in days:
+        key = _month_key(day.date)
+        if current is None or current["month"] != key:
+            if current is not None:
+                close_month(current)
+                prev_close = current["ending"]
+            current = {
+                "month": key,
+                # the month opens where the last one closed; at inception it
+                # opens before the first day's own flow landed
+                "beginning": prev_close if prev_close is not None else (day.value - day.flow - day.income),
+                "flows": ZERO,
+                "income": ZERO,
+                "ending": day.value,
+            }
+        current["flows"] += day.flow
+        current["income"] += day.income
+        current["ending"] = day.value
+    if current is not None:
+        close_month(current)
+
+    rows.reverse()  # newest first, the way a statement archive reads
+    if months is not None:
+        rows = rows[:months]
+    return MonthlyPerformanceOut(months=rows)
+
+
+def month_events(db: Session, user: User, month: str, account_id: str | None,
+                 scenario_id: str | None = None,
+                 account_type: AccountType | None = None) -> list[MonthEventOut]:
+    """What actually happened in one month — the drill-down behind a table row.
+
+    Deliberately the month's *events* rather than its daily values: thirty rows
+    of small market moves answer nothing, and the daily shape is already the
+    chart. What a reader wants when a month is up $8,763 is which deposits,
+    fills and dividends produced it.
+    """
+    try:
+        year, mon = (int(x) for x in month.split("-"))
+        start = date(year, mon, 1)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="month must be YYYY-MM")
+    end = date(year + (mon == 12), (mon % 12) + 1, 1) - timedelta(days=1)
+
+    accounts = _user_accounts(db, user, account_id, scenario_id)
+    if account_type is not None:
+        accounts = [a for a in accounts if a.account_type == account_type]
+    ids = [a.id for a in accounts]
+    if not ids:
+        return []
+    names = {a.id: a.name for a in accounts}
+    events: list[MonthEventOut] = []
+
+    for f in db.execute(select(Contribution).where(Contribution.account_id.in_(ids))).scalars():
+        d = f.timestamp.date()
+        if start <= d <= end:
+            amount = Decimal(f.amount)
+            events.append(MonthEventOut(
+                date=d, kind=f.kind.value, account=names.get(f.account_id, ""),
+                description=_flow_label(f.kind.value, amount)
+                            + (f" (tax year {f.tax_year})" if f.tax_year else ""),
+                amount=amount.quantize(CENT), backdated=False,
+            ))
+
+    for t in db.execute(select(Transaction).where(Transaction.account_id.in_(ids))).scalars():
+        if start <= t.as_of <= end:
+            gross = Decimal(t.gross_amount)
+            signed = -gross if t.side == OrderSide.BUY else gross
+            events.append(MonthEventOut(
+                date=t.as_of, kind=t.side.value, account=names.get(t.account_id, ""),
+                description=(f"{t.side.value.title()} {Decimal(t.shares_filled):,.4f} "
+                             f"{t.ticker} @ {Decimal(t.executed_price):,.2f}"),
+                amount=signed.quantize(CENT), backdated=bool(t.backdated),
+            ))
+
+    for dv in db.execute(select(Dividend).where(Dividend.account_id.in_(ids))).scalars():
+        if start <= dv.event_date <= end:
+            events.append(MonthEventOut(
+                date=dv.event_date, kind="DIVIDEND", account=names.get(dv.account_id, ""),
+                description=f"{dv.ticker} dividend",
+                amount=Decimal(dv.amount).quantize(CENT), backdated=False,
+            ))
+
+    events.sort(key=lambda e: (e.date, e.kind))
+    return events
 
 
 def _modified_dietz(begin: Decimal, flows: list[tuple[date, Decimal]], end: Decimal,

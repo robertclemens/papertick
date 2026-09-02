@@ -58,3 +58,10 @@ export function dateTime(iso: string | null | undefined): string {
     hour: "numeric", minute: "2-digit",
   });
 }
+
+/** "2026-09" -> "Sep 2026". The month strip on the dashboard and the
+ *  month-by-month table label the same row, so they share one formatter. */
+export function monthLabel(month: string): string {
+  const [y, m] = month.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString("en-US", { month: "short", year: "numeric" });
+}

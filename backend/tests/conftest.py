@@ -6,9 +6,6 @@ os.environ.setdefault("SECRET_KEY", "unit-test-secret-key-0123456789abcdef012345
 os.environ.setdefault("MARKET_DATA_PROVIDER", "synthetic")
 os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:63790/9")  # unreachable: caches fail open
 os.environ.setdefault("ENFORCE_MARKET_HOURS", "false")  # hours-specific tests opt back in
-# The backtest engine is the subject of many tests; the gate itself is covered
-# by tests that opt back out (see test_market_rules.py).
-os.environ.setdefault("ALLOW_BACKDATED_TRADES", "true")
 
 import pytest
 from sqlalchemy import create_engine
@@ -51,7 +48,7 @@ def user(db):
 def scenario(db, user):
     """Every account lives in a scenario; tests use one track unless they are
     specifically about scenarios."""
-    s = Scenario(user_id=user.id, name="Scenario 1", sort_order=0)
+    s = Scenario(user_id=user.id, name="Scenario 1", sort_order=0, allow_backdated=True)
     db.add(s)
     db.commit()
     user.default_scenario_id = s.id
@@ -81,6 +78,18 @@ def voo_asset(db):
 def taxable(db, user, voo_asset, scenario):
     a = Account(user_id=user.id, scenario_id=scenario.id, account_type=AccountType.TAXABLE,
                 name="Brokerage", settlement_balance=Decimal("10000"))
+    db.add(a)
+    db.commit()
+    return a
+
+
+@pytest.fixture()
+def rollover(db, user, voo_asset, scenario):
+    """The one account type the IRS bars from taking a regular contribution, so
+    the only one whose purchases cannot pull cash in when the settlement fund
+    is short. Tests that need cash-only behaviour use it."""
+    a = Account(user_id=user.id, scenario_id=scenario.id, account_type=AccountType.ROLLOVER_IRA,
+                name="Rollover", settlement_balance=Decimal("0"))
     db.add(a)
     db.commit()
     return a
@@ -126,6 +135,7 @@ class FakeRedis:
 
     def __init__(self):
         self.store: dict[str, str] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
 
     def get(self, k):
         return self.store.get(k)
@@ -141,9 +151,17 @@ class FakeRedis:
     def expire(self, k, seconds):
         return True
 
+    # hash commands: the price-convention verdict store uses them
+    def hset(self, k, mapping=None, **kw):
+        self.hashes.setdefault(k, {}).update(mapping or kw)
+
+    def hgetall(self, k):
+        return dict(self.hashes.get(k, {}))
+
     def delete(self, *keys):
         for k in keys:
             self.store.pop(k, None)
+            self.hashes.pop(k, None)
 
     def ping(self):
         return True

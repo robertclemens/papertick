@@ -216,8 +216,22 @@ def period_data(db: Session, user: User, start: date, end: date,
     realized_lt = sum((Decimal(t.realized_lt or 0) for t in txns), ZERO) + \
         sum((Decimal(t.realized_lt or 0) for t in otxns), ZERO)
 
+    # Past-dated fills that land inside this period. Counted on `as_of` rather
+    # than on when they were entered, because that is what makes them matter
+    # here: a fill entered in August for a June date never appears in June's
+    # activity list, but it moves June's beginning and ending value. A statement
+    # whose totals were produced with hindsight has to say so on its face.
+    backdated_fills = len([
+        t for t in (db.execute(
+            select(Transaction).where(Transaction.account_id.in_(ids),
+                                      Transaction.backdated.is_(True))
+        ).scalars() if ids else [])
+        if start <= t.as_of <= end
+    ])
+
     return {
         "accounts": accounts,
+        "backdated_fills": backdated_fills,
         "beginning": snapshot_value(db, ids, start - timedelta(days=1)),
         "ending": snapshot_value(db, ids, end),
         "deposits": deposits.quantize(CENT),
@@ -331,6 +345,17 @@ def build_pdf(user: User, data: dict, kind: StatementKind, start: date, end: dat
         Spacer(1, 14),
     ]
 
+    if data.get("backdated_fills"):
+        n = data["backdated_fills"]
+        story.append(Paragraph(
+            f"This period includes {n} past-dated trade{'s' if n != 1 else ''} — "
+            "order(s) entered after the date they were filled on, and therefore "
+            "placed with the outcome already known. The figures above include "
+            "them. They are marked \u201cas of\u201d in the activity list below.",
+            _NOTE,
+        ))
+        story.append(Spacer(1, 12))
+
     if data["holdings"]:
         story.append(Paragraph(f"Holdings as of {end.strftime('%B %-d, %Y')}", _H2))
         rows = [
@@ -344,7 +369,14 @@ def build_pdf(user: User, data: dict, kind: StatementKind, start: date, end: dat
     activity_rows: list[list[str]] = []
     names = data["account_names"]
     for f in data["flows"]:
-        label = {"CONTRIBUTION": "Deposit", "ROLLOVER": "Rollover in", "WITHDRAWAL": "Withdrawal"}[f.kind.value]
+        # .get, not [...]: an unmapped kind must not take a statement down.
+        # A conversion writes a signed pair, so the sign says which leg this is.
+        label = {
+            "CONTRIBUTION": "Deposit",
+            "ROLLOVER": "Rollover in",
+            "WITHDRAWAL": "Withdrawal",
+            "CONVERSION": "Roth conversion in" if Decimal(f.amount) > 0 else "Roth conversion out",
+        }.get(f.kind.value, f.kind.value.title())
         desc = label + (f" (tax year {f.tax_year})" if f.tax_year else "")
         activity_rows.append([f.timestamp.date().isoformat(), names.get(f.account_id, ""), desc, _m(Decimal(f.amount))])
     for t in data["txns"]:

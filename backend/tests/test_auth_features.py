@@ -238,14 +238,15 @@ def test_passkey_auth_options(monkeypatch):
     assert opts.get("allowCredentials", []) == []  # discoverable / usernameless
     assert f"auth:{flow_id}" in store
 
-def test_enrolled_mfa_is_required_on_both_sign_in_paths(db, user, monkeypatch):
-    """MFA the user turned on has to hold on every route into the account.
+def test_mfa_gates_the_password_path_but_a_passkey_stands_alone(db, user, monkeypatch):
+    """Enrolled TOTP gates the password path; a passkey completes on its own.
 
-    A passkey proves possession of a registered authenticator; it is not a
-    stand-in for the second factor the account is configured to demand. Letting
-    the passkey path issue a session outright would mean anyone who ever got a
-    passkey registered — a borrowed unlocked laptop, say — could sign straight
-    past the victim's own MFA, and a password change would not evict them."""
+    The passkey ceremony runs with `user_verification=REQUIRED` and enforces
+    the flag on the response, so it already proves possession of the
+    authenticator *and* the biometric or PIN that unlocked it — two factors,
+    AAL2, and origin-bound on top. Chaining a phishable TOTP code behind an
+    unphishable credential adds no security and taxes the stronger method,
+    which is how users get pushed back onto passwords."""
     from fastapi import Response
 
     from app.routers.auth import login
@@ -258,21 +259,63 @@ def test_enrolled_mfa_is_required_on_both_sign_in_paths(db, user, monkeypatch):
     user.mfa_enabled = True
     db.commit()
 
+    # password path: still a second step
     out = login(LoginIn(email=user.email, password="a-strong-pass-123"), _req(), Response(), db)
     assert out.mfa_required is True and out.mfa_token and out.tokens is None
 
+    # passkey path: signed in, TOTP enrolled or not
     monkeypatch.setattr(passkeys, "verify_authentication", lambda db_, flow, cred: user)
     passkey_out = login_verify(
         PasskeyLoginVerifyIn(flow_id="flow", credential={}), Response(), db
     )
-    assert passkey_out.mfa_required is True
-    assert passkey_out.mfa_token and passkey_out.tokens is None
+    assert passkey_out.mfa_required is False and passkey_out.tokens is not None
 
-    # without MFA enrolled the passkey remains a one-step sign-in
     user.mfa_enabled = False
     db.commit()
     plain = login_verify(PasskeyLoginVerifyIn(flow_id="flow", credential={}), Response(), db)
     assert plain.mfa_required is False and plain.tokens is not None
+
+
+def test_passwordless_needs_a_spare_passkey_and_then_refuses_the_password(db, user):
+    """Turning off the password path requires two passkeys, and holds after."""
+    import pytest as _pytest
+    from fastapi import HTTPException, Response
+
+    from app.deps import Principal
+    from app.models import WebAuthnCredential
+    from app.routers.auth import login
+    from app.routers.passkeys_router import delete_passkey, set_passwordless
+    from app.schemas import LoginIn, PasswordlessIn
+
+    user.password_hash = security.hash_password("a-strong-pass-123")
+    user.mfa_enabled = False
+    db.commit()
+    principal = Principal(user=user, scopes={"read", "trade", "manage"})
+    body = PasswordlessIn(enabled=True, current_password="a-strong-pass-123")
+
+    # one passkey is not enough: losing it would be a permanent lockout
+    keys = []
+    for i in range(2):
+        with _pytest.raises(HTTPException) as exc:
+            set_passwordless(body, principal, db)
+        assert exc.value.status_code == 422
+        row = WebAuthnCredential(user_id=user.id, credential_id=f"cred-{i}",
+                                 public_key=f"pk-{i}", nickname=f"Key {i}")
+        db.add(row)
+        db.commit()
+        keys.append(row)
+
+    assert set_passwordless(body, principal, db).passkey_only is True
+
+    # the password is now refused even though it is correct
+    with _pytest.raises(HTTPException) as exc:
+        login(LoginIn(email=user.email, password="a-strong-pass-123"), _req(), Response(), db)
+    assert exc.value.status_code == 403
+
+    # and the account cannot be whittled back down to a single authenticator
+    with _pytest.raises(HTTPException) as exc:
+        delete_passkey(keys[0].id, principal, db)
+    assert exc.value.status_code == 422
 
 
 def test_adding_a_passkey_needs_the_password_and_a_code(db, user, monkeypatch):
@@ -441,8 +484,7 @@ def test_rollover_ira_takes_rollovers_only(db, user, roth, limits):
     from app.services.trading import fundable_amount
 
     rollover = Account(user_id=user.id, scenario_id=roth.scenario_id, account_type=AccountType.ROLLOVER_IRA,
-                       name="Rollover", settlement_balance=Decimal("0"),
-                       allow_external_funding=True)
+                       name="Rollover", settlement_balance=Decimal("0"))
     db.add(rollover)
     db.commit()
 

@@ -17,6 +17,7 @@ from app.models import (
     AccountType,
     CashFlowKind,
     Contribution,
+    Conversion,
     Dividend,
     OptionTransaction,
     OrderSide,
@@ -24,6 +25,7 @@ from app.models import (
     User,
 )
 from app.schemas import TaxYearSummaryOut
+from app.services import ira
 
 ZERO = Decimal("0")
 CENT = Decimal("0.01")
@@ -105,10 +107,49 @@ def tax_report(db: Session, user: User, year: int, account_id: str | None = None
             q2 = q2.where(extract("year", Contribution.timestamp) == year)
         return _dec(db.execute(q2).scalar_one())
 
+    # Conversions out of the pre-tax side, and the part of them that was
+    # ordinary income. Read off the Conversion rows rather than the cash-flow
+    # pair, because only the Conversion row carries the pro-rata split.
+    conv_gross = conv_taxable = ZERO
+    if trad_ids:
+        for c in db.execute(
+            select(Conversion).where(Conversion.from_account_id.in_(trad_ids))
+        ).scalars():
+            if c.conversion_date.year == year:
+                conv_gross += _dec(c.gross_amount)
+                conv_taxable += _dec(c.taxable_amount)
+
+    # After-tax basis still sitting on the pre-tax side — the Form 8606 running
+    # figure that makes future distributions partly tax-free.
+    basis_left = sum((_dec(a.after_tax_basis)
+                      for a in accounts if a.id in trad_ids), ZERO)
+
     trad_withdrawals = ZERO - _flows(trad_ids, CashFlowKind.WITHDRAWAL, by_tax_year=False)
     roth_withdrawals = ZERO - _flows(roth_ids, CashFlowKind.WITHDRAWAL, by_tax_year=False)
     contributions = _flows(ira_ids, CashFlowKind.CONTRIBUTION, by_tax_year=True)
     rollovers = _flows(ira_ids, CashFlowKind.ROLLOVER, by_tax_year=False)
+
+    # The 10% additional tax, recomputed from the withdrawals themselves so the
+    # figure survives an import or a scenario copy — nothing about it is stored.
+    penalty = ZERO
+    if ira_ids:
+        for c in db.execute(
+            select(Contribution).where(Contribution.account_id.in_(ira_ids),
+                                       Contribution.kind == CashFlowKind.WITHDRAWAL)
+        ).scalars():
+            if c.timestamp.year != year or c.penalty_exception:
+                continue
+            account = next((a for a in accounts if a.id == c.account_id), None)
+            if account is None or ira.is_penalty_free_age(user, c.timestamp.date()):
+                continue
+            gross = -_dec(c.amount)
+            if account.id in roth_ids:
+                plan = ira.plan_roth_withdrawal(db, user, scenario_id, gross,
+                                                c.timestamp.date())
+            else:
+                plan = ira.plan_traditional_withdrawal(db, user, scenario_id, gross,
+                                                       c.timestamp.date())
+            penalty += plan.penalty
 
     notes = [
         "Simulation only — not tax advice. Gains follow your elected cost-basis method (FIFO default).",
@@ -121,6 +162,22 @@ def tax_report(db: Session, user: User, year: int, account_id: str | None = None
         )
     if trad_withdrawals > 0:
         notes.append("Traditional/Rollover IRA withdrawals would be ordinary income (plus a 10% penalty before 59½).")
+    if conv_gross > 0:
+        notes.append(
+            f"Roth conversions of ${conv_gross} this year, of which ${conv_taxable} is "
+            "ordinary income. Conversions have no annual limit and no income cap, so they "
+            "use none of your contribution room — and each starts its own five-year clock."
+        )
+    if basis_left > 0:
+        notes.append(
+            f"${basis_left} of after-tax basis remains across your Traditional and Rollover "
+            "IRAs (Form 8606). It comes out prorated against their combined value, never "
+            "on its own."
+        )
+    notes.append(
+        "Not modelled: required minimum distributions, the individual exceptions to the "
+        "10% early-distribution penalty, state income tax, and the net investment income tax."
+    )
 
     return TaxYearSummaryOut(
         year=year,
@@ -134,6 +191,10 @@ def tax_report(db: Session, user: User, year: int, account_id: str | None = None
         roth_withdrawals=roth_withdrawals,
         ira_contributions=contributions,
         rollovers=rollovers,
+        conversions=conv_gross,
+        conversion_taxable=conv_taxable,
+        early_withdrawal_penalty=penalty,
+        after_tax_basis=basis_left,
         notes=notes,
     )
 
@@ -151,5 +212,9 @@ def tax_report_csv(report: TaxYearSummaryOut) -> str:
         f"roth_ira_withdrawals,{report.roth_withdrawals}",
         f"ira_contributions_designated,{report.ira_contributions}",
         f"rollovers,{report.rollovers}",
+        f"roth_conversions_gross,{report.conversions}",
+        f"roth_conversions_taxable,{report.conversion_taxable}",
+        f"early_withdrawal_penalty,{report.early_withdrawal_penalty}",
+        f"after_tax_basis_remaining,{report.after_tax_basis}",
     ]
     return "\n".join(lines) + "\n"

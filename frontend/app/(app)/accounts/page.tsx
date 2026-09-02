@@ -13,7 +13,8 @@ import {
   RangeT,
 } from "@/lib/api";
 import { money, pct, shortDate, signedMoney } from "@/lib/format";
-import { Card, Dialog, Empty, ErrorText, Spinner } from "@/components/ui";
+import { useMarketRefresh } from "@/lib/market-refresh";
+import { Card, Dialog, Empty, ErrorText, Spinner, MarketStatus } from "@/components/ui";
 import ContributionBars from "@/components/contribution-bars";
 import { useRangePref } from "@/lib/prefs";
 
@@ -34,6 +35,16 @@ export default function AccountsPage() {
     api<AccountT[]>("/accounts").then(setAccounts).catch(() => setAccounts([]));
   }
   useEffect(load, []);
+
+  /** Balances and per-account returns are priced off the live market, so they
+   *  re-fetch on the same cadence as the dashboard. Quietly: no spinner over
+   *  numbers already on screen. */
+  const { status: marketStatus, lastRefresh, refreshing, refreshNow } = useMarketRefresh(() => {
+    api<AccountT[]>("/accounts").then(setAccounts).catch(() => {});
+    if (range) {
+      api<AccountReturnsT>(`/portfolio/returns?range=${range}`).then(setReturns).catch(() => {});
+    }
+  });
 
   // balance / investment returns / rate of return follow the timeframe picker
   useEffect(() => {
@@ -100,6 +111,8 @@ export default function AccountsPage() {
             Taxable and tax-advantaged buckets, with IRS contribution rules enforced.
             Drag a row to reorder; click a name to rename it.
           </p>
+          <MarketStatus status={marketStatus} lastRefresh={lastRefresh}
+                        refreshing={refreshing} onRefresh={refreshNow} />
         </div>
         <div className="flex items-center gap-2">
           <div className="flex gap-1" role="group" aria-label="Returns timeframe">

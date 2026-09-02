@@ -12,16 +12,17 @@ import {
   CostBasisConfigT,
   CostBasisMethodT,
   LotT,
-  MarketStatusT,
   OrderT,
   PositionT,
   QuoteT,
   TransactionT,
 } from "@/lib/api";
 import { dateTime, money, pct, shares as fmtShares, shortDate } from "@/lib/format";
-import { Badge, Card, ErrorText, InfoText, Spinner } from "@/components/ui";
+import { useMarketRefresh } from "@/lib/market-refresh";
+import { Badge, Card, ErrorText, InfoText, MarketStatus, Spinner } from "@/components/ui";
 import SymbolSearch from "@/components/symbol-search";
 import ExchangeForm from "@/components/exchange-form";
+import ConversionForm from "@/components/conversion-form";
 
 type Mode = "now" | "backtest" | "schedule";
 
@@ -34,7 +35,7 @@ export default function TradePage() {
   const [quote, setQuote] = useState<QuoteT | null>(null);
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
   // Buy and Sell share one order ticket; Exchange is its own two-leg ticket.
-  const [ticket, setTicket] = useState<"BUY" | "SELL" | "EXCHANGE">("BUY");
+  const [ticket, setTicket] = useState<"BUY" | "SELL" | "EXCHANGE" | "CONVERT">("BUY");
   const [qtyType, setQtyType] = useState<"DOLLARS" | "SHARES">("DOLLARS");
   const [quantity, setQuantity] = useState("");
   const [orderType, setOrderType] = useState<"MARKET" | "LIMIT">("MARKET");
@@ -46,25 +47,11 @@ export default function TradePage() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ order: OrderT; transaction: TransactionT | null; funding?: string | null } | null>(null);
-  const [market, setMarket] = useState<MarketStatusT | null>(null);
   const [cbConfig, setCbConfig] = useState<CostBasisConfigT | null>(null);
   const [pickLots, setPickLots] = useState(false);
   const [lots, setLots] = useState<LotT[]>([]);
   const [positions, setPositions] = useState<PositionT[] | null>(null);
   const [pickedLots, setPickedLots] = useState<Record<string, string>>({});
-
-  useEffect(() => {
-    const fetchStatus = () =>
-      api<MarketStatusT>("/market/status")
-        .then((status) => {
-          setMarket(status);
-          if (!status.allow_backdated_trades) setMode((m) => (m === "backtest" ? "now" : m));
-        })
-        .catch(() => {});
-    fetchStatus();
-    const t = setInterval(fetchStatus, 60000);
-    return () => clearInterval(t);
-  }, []);
 
   useEffect(() => {
     api<AccountT[]>("/accounts").then((rows) => {
@@ -104,6 +91,23 @@ export default function TradePage() {
       })
       .catch(() => setQuote(null));
   }, [ticker]);
+
+  /** The ticket quotes a price the user is about to trade on, so a stale one
+   *  is worse here than anywhere else. Re-quote the selected symbol on the
+   *  market-aware cadence; `setQuote` only, so nothing else on the ticket
+   *  moves under the user mid-entry. */
+  const { status: market, lastRefresh, refreshing, refreshNow } = useMarketRefresh(() => {
+    if (!ticker) return;
+    api<QuoteT>(`/market/quote/${ticker}`).then(setQuote).catch(() => {});
+  });
+
+  // a deployment that forbids past-dated fills must not leave the ticket sitting
+  // on a mode the server is going to reject
+  useEffect(() => {
+    if (market && !market.allow_backdated_trades) {
+      setMode((m) => (m === "backtest" ? "now" : m));
+    }
+  }, [market]);
 
   const loadPositions = useCallback(() => {
     if (!accountId) {
@@ -225,39 +229,30 @@ export default function TradePage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Trade</h1>
           <p className="mt-1 text-sm text-slate-400">
-            Buy, sell, or exchange one holding for another — at live prices, on a past
-            date, or scheduled for later.
+            Buy, sell, exchange one holding for another, or convert pre-tax IRA money to
+            Roth — at live prices, on a past date, or scheduled for later.
           </p>
+          <MarketStatus status={market} lastRefresh={lastRefresh}
+                        refreshing={refreshing} onRefresh={refreshNow} />
         </div>
-        {market && market.enforce_market_hours && (
-          <div className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm ${
-            market.is_open
-              ? "border-emerald-900 bg-emerald-950/40 text-emerald-300"
-              : "border-amber-900 bg-amber-950/30 text-amber-200"
-          }`}>
-            <span aria-hidden className={`h-2 w-2 rounded-full ${market.is_open ? "bg-emerald-400" : "bg-amber-400"}`} />
-            {market.is_open
-              ? `Market open · closes ${dateTime(market.next_close)}`
-              : `Market closed · orders queue for ${dateTime(market.next_open)}`}
-          </div>
-        )}
       </header>
 
       <div className="flex rounded-lg border border-slate-700 bg-slate-950 p-1 sm:max-w-md"
            role="group" aria-label="Transaction type">
-        {(["BUY", "SELL", "EXCHANGE"] as const).map((t) => (
+        {(["BUY", "SELL", "EXCHANGE", "CONVERT"] as const).map((t) => (
           <button
             key={t}
             type="button"
             className={seg(ticket === t)}
             onClick={() => {
               setTicket(t);
-              if (t !== "EXCHANGE") setSide(t);
+              if (t === "BUY" || t === "SELL") setSide(t);
               setResult(null);
               setError("");
             }}
           >
-            {t === "BUY" ? "Buy" : t === "SELL" ? "Sell" : "Exchange"}
+            {t === "BUY" ? "Buy" : t === "SELL" ? "Sell"
+              : t === "EXCHANGE" ? "Exchange" : "Convert"}
           </button>
         ))}
       </div>
@@ -269,7 +264,14 @@ export default function TradePage() {
         />
       )}
 
-      <div className={ticket === "EXCHANGE"
+      {ticket === "CONVERT" && (
+        <ConversionForm
+          accounts={accounts}
+          onExecuted={() => { api<AccountT[]>("/accounts").then(setAccounts).catch(() => {}); }}
+        />
+      )}
+
+      <div className={ticket === "EXCHANGE" || ticket === "CONVERT"
         ? "hidden"
         : "grid items-start gap-4 lg:grid-cols-3"}>
         <Card title={`${side === "BUY" ? "Buy" : "Sell"} order ticket`} className="lg:col-span-2">
@@ -294,7 +296,7 @@ export default function TradePage() {
                     {account.buying_power !== null &&
                       parseFloat(account.buying_power) < parseFloat(account.settlement_balance) &&
                       ` of ${money(account.settlement_balance)} in the settlement fund (rest committed to open orders or collateral)`}
-                    {account.allow_external_funding && " · shortfalls draw from your external bank"}
+                    {" · a shortfall transfers in from your bank"}
                   </p>
                 )}
               </div>

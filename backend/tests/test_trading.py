@@ -28,19 +28,19 @@ def test_market_buy_dollars(db, taxable):
     assert Decimal(pos.shares) == txn.shares_filled
 
 
-def test_insufficient_funds_rejected_without_external_funding(db, taxable):
+def test_insufficient_funds_rejected_when_cash_cannot_be_pulled_in(db, rollover):
     from fastapi import HTTPException
     import pytest
 
-    taxable.allow_external_funding = False
+    rollover.settlement_balance = Decimal("10000")
     db.commit()
     with pytest.raises(HTTPException) as exc:
         trading.place_order(
-            db, taxable, _order_in(taxable.id, quantity=Decimal("99999")), OrderSource.API
+            db, rollover, _order_in(rollover.id, quantity=Decimal("99999")), OrderSource.API
         )
     assert exc.value.status_code == 422
     assert "Insufficient buying power" in exc.value.detail
-    assert Decimal(taxable.settlement_balance) == Decimal("10000")
+    assert Decimal(rollover.settlement_balance) == Decimal("10000")
 
 
 def test_sell_realizes_pnl_and_clears_position(db, taxable):
@@ -117,3 +117,44 @@ def test_scheduling_next_run():
     assert weekly.weekday() == 0 and weekly > after
     daily = compute_next_run(Cadence.DAILY, None, None, after)
     assert daily.weekday() < 5 and daily > after
+
+
+# ------------------------------------------------------------ variable slippage
+
+def test_variable_slippage_is_bounded_deterministic_and_two_sided():
+    """A static 2bp on every fill is the one thing real fills never look like.
+
+    The draw has to stay inside the configured window, reproduce exactly for
+    the same order (so replaying a backtest does not invent new fills), and
+    occasionally come out favourable — retail flow does receive price
+    improvement, and a model that only ever charges is not a model of the
+    market."""
+    from app.config import get_settings
+    from app.services.trading import _slippage_bps
+
+    s = get_settings()
+    draws = [_slippage_bps(f"order-{i}") for i in range(3000)]
+    assert all(s.slippage_bps_min <= float(d) <= s.slippage_bps_max for d in draws)
+    assert _slippage_bps("order-7") == _slippage_bps("order-7")
+    assert len(set(draws)) > 1000, "a distribution, not a constant"
+    assert any(d < 0 for d in draws), "some fills should beat the quote"
+    assert sum(d for d in draws) / len(draws) > 0, "but the mean stays adverse"
+
+
+def test_slippage_moves_the_price_against_the_side(db, user, taxable, scenario):
+    from decimal import Decimal as D
+
+    from app.services.trading import _slipped
+
+    px = D("100.0000")
+    assert _slipped(px, OrderSide.BUY, "seed-a") > px
+    assert _slipped(px, OrderSide.SELL, "seed-a") < px
+
+
+def test_slippage_preview_is_stable(db):
+    """A quote shown before the trade must not move on refresh, so the
+    unseeded (preview) draw is the distribution's mode, not a sample."""
+    from app.config import get_settings
+    from app.services.trading import _slippage_bps
+
+    assert _slippage_bps(None) == _slippage_bps(None) == get_settings().slippage_bps

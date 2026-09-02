@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { withBasePath } from "@/lib/base-path";
 import { api, ApiError } from "@/lib/api";
 import { dateTime } from "@/lib/format";
-import { Badge, Card, Dialog, Empty, ErrorText, InfoText, Spinner } from "@/components/ui";
+import { Badge, Card, ConfirmDialog, Dialog, Empty, ErrorText, InfoText, Spinner } from "@/components/ui";
 
 interface KeyT {
   id: string;
@@ -16,7 +16,10 @@ interface KeyT {
   created_at: string;
 }
 
-export default function KeysPage() {
+/** API keys are account access, so they live beside passwords, passkeys and
+ *  MFA rather than in a page of their own: everything that can sign in to this
+ *  account is reviewable in one place. */
+export default function ApiKeysCard() {
   const [keys, setKeys] = useState<KeyT[] | null>(null);
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -24,6 +27,7 @@ export default function KeysPage() {
   const [scopeTrade, setScopeTrade] = useState(false);
   const [created, setCreated] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [revoking, setRevoking] = useState<KeyT | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -56,9 +60,16 @@ export default function KeysPage() {
     }
   }
 
-  async function revoke(id: string) {
-    await api(`/api-keys/${id}`, { method: "DELETE" }).catch(() => {});
-    load();
+  async function revoke() {
+    if (!revoking) return;
+    setBusy(true);
+    try {
+      await api(`/api-keys/${revoking.id}`, { method: "DELETE" }).catch(() => {});
+      setRevoking(null);
+      load();
+    } finally {
+      setBusy(false);
+    }
   }
 
   function closeDialog() {
@@ -67,69 +78,58 @@ export default function KeysPage() {
     setCopied(false);
   }
 
-  return (
-    <div className="space-y-6">
-      <header className="flex items-end justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">API keys</h1>
-          <p className="mt-1 text-sm text-slate-400">
-            Full platform access for CLI tools and AI agents. Send as{" "}
-            <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs">Authorization: Bearer ptk_…</code>{" "}
-            — see the{" "}
-            <a href={withBasePath("/api/docs")} target="_blank" rel="noopener noreferrer"
-               className="font-medium text-emerald-400 hover:text-emerald-300">
-              interactive API reference
-            </a>{" "}
-            for every endpoint.
-          </p>
-        </div>
-        <div className="flex shrink-0 gap-2">
-          <a className="btn-ghost" href={withBasePath("/api/docs")} target="_blank" rel="noopener noreferrer">
-            API docs ↗
-          </a>
-          <button className="btn-primary" onClick={() => { setOpen(true); setError(""); }}>
-            Generate key
-          </button>
-        </div>
-      </header>
+  const live = keys?.filter((k) => !k.revoked_at) ?? [];
 
-      <Card>
-        {!keys ? (
-          <Spinner />
-        ) : keys.length === 0 ? (
-          <Empty>No API keys yet.</Empty>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="table-base">
-              <thead>
-                <tr><th>Name</th><th>Key</th><th>Scopes</th><th>Last used</th><th>Status</th><th></th></tr>
-              </thead>
-              <tbody>
-                {keys.map((k) => (
-                  <tr key={k.id} className={k.revoked_at ? "opacity-50" : ""}>
-                    <td className="font-medium">{k.name}</td>
-                    <td><code className="text-xs text-slate-400">{k.prefix}…</code></td>
-                    <td>
-                      <div className="flex gap-1">
-                        {k.scopes.split(",").map((s) => <Badge key={s} value={s} />)}
-                      </div>
-                    </td>
-                    <td className="text-xs">{dateTime(k.last_used_at)}</td>
-                    <td>{k.revoked_at ? <Badge value="CANCELLED" /> : <Badge value="ACTIVE" />}</td>
-                    <td className="text-right">
-                      {!k.revoked_at && (
-                        <button className="text-xs text-red-400 hover:text-red-300" onClick={() => revoke(k.id)}>
-                          Revoke
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
+  return (
+    <Card title="API keys" action={live.length > 0 ? <Badge value="ACTIVE" /> : undefined}>
+      <p className="mb-3 text-sm text-slate-400">
+        Full platform access for CLI tools and AI agents — every action in this UI is also a
+        REST call. Send the key as{" "}
+        <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs">Authorization: Bearer ptk_…</code>{" "}
+        and see the{" "}
+        <a href={withBasePath("/api/docs")} target="_blank" rel="noopener noreferrer"
+           className="font-medium text-emerald-400 hover:text-emerald-300">
+          interactive API reference
+        </a>{" "}
+        for every endpoint.
+      </p>
+
+      {!keys ? (
+        <Spinner />
+      ) : keys.length === 0 ? (
+        <Empty>No API keys yet.</Empty>
+      ) : (
+        <ul className="mb-3 divide-y divide-slate-800/60">
+          {keys.map((k) => (
+            <li key={k.id}
+                className={`flex items-center justify-between gap-3 py-2 ${k.revoked_at ? "opacity-50" : ""}`}>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2 text-sm font-medium text-slate-100">
+                  <span className="truncate">{k.name}</span>
+                  <code className="text-xs font-normal text-slate-500">{k.prefix}…</code>
+                  {k.scopes.split(",").map((s) => <Badge key={s} value={s} />)}
+                  {k.revoked_at && <Badge value="CANCELLED" />}
+                </div>
+                <div className="text-xs text-slate-500">
+                  {k.revoked_at
+                    ? `revoked ${dateTime(k.revoked_at)}`
+                    : `last used ${k.last_used_at ? dateTime(k.last_used_at) : "never"}`}
+                </div>
+              </div>
+              {!k.revoked_at && (
+                <button className="shrink-0 text-xs text-red-400 hover:text-red-300"
+                        onClick={() => setRevoking(k)}>
+                  Revoke
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <button className="btn-primary" onClick={() => { setOpen(true); setError(""); }}>
+        Generate key
+      </button>
 
       <Dialog open={open} title={created ? "Key created" : "Generate API key"} onClose={closeDialog}>
         {created ? (
@@ -179,6 +179,22 @@ export default function KeysPage() {
           </form>
         )}
       </Dialog>
-    </div>
+
+      <ConfirmDialog
+        open={revoking !== null}
+        title="Revoke API key"
+        confirmLabel="Revoke key"
+        busy={busy}
+        onConfirm={revoke}
+        onClose={() => setRevoking(null)}
+      >
+        <p>
+          <span className="font-medium text-slate-100">{revoking?.name}</span> stops working
+          immediately. Anything still signing requests with it — a script, a cron job, an agent —
+          starts failing on its next call.
+        </p>
+        <p>This cannot be undone; issue a new key instead.</p>
+      </ConfirmDialog>
+    </Card>
   );
 }

@@ -21,6 +21,7 @@ from app.rate_limit import (
     record_login_failure,
 )
 from app.schemas import (
+    DeviceLoginIn,
     DobImpactOut,
     EmailTokenIn,
     LoginIn,
@@ -35,9 +36,11 @@ from app.schemas import (
     ResendVerificationIn,
     SignupIn,
     TokenPair,
+    TrustedDeviceOut,
     UserOut,
 )
 from app import security
+from app.services import devices, scenarios
 from app.services.mailer import send_email_change_email, send_verification_email
 
 log = logging.getLogger("papertick.auth")
@@ -143,6 +146,10 @@ def signup(data: SignupIn, response: Response, db: Session = Depends(get_db)) ->
         email_verified=not production,
     )
     db.add(user)
+    db.flush()
+    # A user with no scenario has nowhere to put an account, and the startup
+    # backfill only runs at boot — so create it here, in the same transaction.
+    scenarios.ensure_default(db, user)
     db.commit()
     if production:
         send_verification_email(email, security.make_email_verify_token(user.id))
@@ -179,13 +186,29 @@ def login(data: LoginIn, request: Request, response: Response,
             status_code=403,
             detail="Email not verified. Check your inbox for the confirmation link, or request a new one.",
         )
+    if user.passkey_only:
+        # The password was correct, but this account has opted out of the
+        # password path. Said plainly: the user turned this on deliberately and
+        # needs to know why their password is being refused. It leaks nothing
+        # a correct password did not already confirm.
+        raise HTTPException(
+            status_code=403,
+            detail="This account signs in with a passkey. Use “Use a passkey” instead.",
+        )
     clear_login_failures(email, ip)
     if security.password_needs_rehash(user.password_hash):
         user.password_hash = security.hash_password(data.password)
         db.commit()
     if user.mfa_enabled:
         return LoginOut(mfa_required=True, mfa_token=security.make_mfa_token(user.id))
-    return LoginOut(tokens=_issue_tokens(db, user, response))
+    if devices.verification_required(db, user, request):
+        return LoginOut(
+            device_verification_required=True,
+            device_token=devices.start_challenge(db, user, request),
+        )
+    tokens = _issue_tokens(db, user, response)
+    _remember_if_applicable(db, user, request, response)
+    return LoginOut(tokens=tokens)
 
 
 @router.post("/login/mfa", response_model=LoginOut,
@@ -210,6 +233,63 @@ def login_mfa(data: MfaLoginIn, request: Request, response: Response,
         raise HTTPException(status_code=401, detail="Invalid authentication code")
     clear_login_failures(user.email, ip)
     return LoginOut(tokens=_issue_tokens(db, user, response))
+
+
+def _remember_if_applicable(db: Session, user: User, request: Request,
+                            response: Response) -> None:
+    """Leave a device token behind when device verification is the account's
+    fallback factor and this browser has none yet. Accounts with a passkey or
+    an authenticator never take this path, so no cookie is minted for them."""
+    s = get_settings()
+    if not (s.device_verification and s.is_production):
+        return
+    if devices.has_second_factor(db, user):
+        return
+    if devices.is_trusted(db, user, request.cookies.get(devices.DEVICE_COOKIE)):
+        return
+    devices.remember(db, user, request, response)
+
+
+@router.post("/login/device", response_model=LoginOut,
+             dependencies=[Depends(rate_limiter("device-otp", 15, 300))])
+def login_device(data: DeviceLoginIn, request: Request, response: Response,
+                 db: Session = Depends(get_db)) -> LoginOut:
+    """Completes a sign-in from an unrecognised browser using the one-time code
+    emailed by `/login`. On success the browser is remembered for
+    DEVICE_TRUST_DAYS and skips this step next time."""
+    user_id = devices.verify_challenge(data.device_token, data.code)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
+    user = db.get(User, user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
+    tokens = _issue_tokens(db, user, response)
+    devices.remember(db, user, request, response)
+    return LoginOut(tokens=tokens)
+
+
+@router.get("/devices", response_model=list[TrustedDeviceOut])
+def list_devices(principal: Principal = Depends(require_manage),
+                 db: Session = Depends(get_db)):
+    """Browsers this account has verified and that may skip the new-device
+    code, newest first."""
+    return [TrustedDeviceOut.model_validate(d) for d in devices.list_for(db, principal.user)]
+
+
+@router.delete("/devices/{device_id}", status_code=204)
+def revoke_device(device_id: str, principal: Principal = Depends(require_manage),
+                  db: Session = Depends(get_db)) -> None:
+    """Forget one browser: its next sign-in needs a fresh code."""
+    if not devices.revoke(db, principal.user, device_id):
+        raise HTTPException(status_code=404, detail="Device not found")
+
+
+@router.delete("/devices", status_code=204)
+def revoke_all_devices(response: Response, principal: Principal = Depends(require_manage),
+                       db: Session = Depends(get_db)) -> None:
+    """Forget every remembered browser, this one included."""
+    devices.revoke_all(db, principal.user)
+    devices.forget_cookie(response)
 
 
 @router.post("/refresh", response_model=LoginOut,

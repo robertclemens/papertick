@@ -1,6 +1,9 @@
 "use client";
 
-import { ReactNode } from "react";
+import { MarketStatusT } from "@/lib/api";
+import { marketStatusView } from "@/lib/market-refresh";
+
+import { ReactNode, useEffect, useState } from "react";
 
 export function Card({ title, action, children, className = "" }: {
   title?: string; action?: ReactNode; children: ReactNode; className?: string;
@@ -163,4 +166,89 @@ export function Spinner() {
 
 export function Empty({ children }: { children: ReactNode }) {
   return <div className="py-8 text-center text-sm text-slate-500">{children}</div>;
+}
+
+
+/** Says that some of the fills behind the numbers on this page were entered for
+ *  a date that had already happened. Stated plainly and without alarm: the point
+ *  is that a return produced with hindsight is never presented as if it were a
+ *  prediction that came good. Renders nothing when there are none. */
+export function BackdatedNote({ count }: { count: number | undefined }) {
+  if (!count) return null;
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 rounded-full border border-amber-900 bg-amber-950/40 px-2.5 py-0.5 text-xs font-medium text-amber-300"
+      title={
+        `${count} of the trades behind these figures were entered after the date they ` +
+        "filled on, so they were placed with the outcome already known."
+      }
+    >
+      <span aria-hidden>◷</span>
+      {count} past-dated fill{count === 1 ? "" : "s"}
+    </span>
+  );
+}
+
+const MARKET_TONE = {
+  live:     { dot: "bg-emerald-400", box: "border-emerald-900 bg-emerald-950/40", text: "text-emerald-300" },
+  settling: { dot: "bg-amber-400",   box: "border-amber-900 bg-amber-950/30",     text: "text-amber-200" },
+  shut:     { dot: "bg-slate-500",   box: "border-slate-700 bg-slate-900/60",     text: "text-slate-300" },
+} as const;
+
+/** The one place a page says whether the market is open, how much of the
+ *  session is left, and how fresh its prices are.
+ *
+ *  There is deliberately no "refresh now" control. While the market is open
+ *  the page re-prices itself on the server's cadence and again the instant the
+ *  tab is looked at; while it is shut there is nothing new to fetch, and a
+ *  button that re-serves the same cached quote only teaches the reader to
+ *  distrust the number. The single exception is a deployment that has turned
+ *  auto-refresh off entirely (MARKET_REFRESH_SECONDS=0), where nothing else
+ *  would ever move the numbers — there, and only there, the control earns its
+ *  place. */
+export function MarketStatus({ status, lastRefresh, refreshing, onRefresh }: {
+  status: MarketStatusT | null;
+  lastRefresh?: Date | null;
+  refreshing?: boolean;
+  onRefresh?: () => void;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  // the countdown is quoted against the server's clock, not the browser's, so
+  // a skewed laptop cannot invent an extra hour of trading
+  const [skew, setSkew] = useState(0);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    if (status) setSkew(Date.parse(status.server_time) - Date.now());
+  }, [status]);
+
+  if (!status) return null;
+  const view = marketStatusView(status, now + skew);
+  const tone = MARKET_TONE[view.tone];
+  const stalled = status.refresh_reason === "off";
+
+  return (
+    <div className={`mt-2 inline-flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border px-3 py-1.5 text-sm ${tone.box}`}>
+      <span
+        aria-hidden
+        className={`h-2 w-2 shrink-0 rounded-full ${tone.dot} ${refreshing ? "animate-pulse" : ""}`}
+      />
+      <span className={`font-medium ${tone.text}`}>{view.headline}</span>
+      <span className="text-slate-400">· {view.detail}</span>
+      {lastRefresh && (
+        <span className="text-xs text-slate-500">
+          · updated {lastRefresh.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+        </span>
+      )}
+      {stalled && onRefresh && (
+        <button type="button" onClick={onRefresh}
+                className="text-xs text-slate-400 underline underline-offset-2 hover:text-slate-200">
+          Refresh
+        </button>
+      )}
+    </div>
+  );
 }

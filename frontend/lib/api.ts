@@ -163,8 +163,9 @@ export interface AccountT {
   settlement_yield: string | null;
   settlement_accrued: string | null;
   cost_basis_method: string;
-  allow_external_funding: boolean;
   buying_power: string | null;
+  /** fills in this account entered for a date already past */
+  backdated_fills: number;
   contribution_statuses: ContributionStatusT[];
   created_at: string;
 }
@@ -218,6 +219,8 @@ export interface SummaryT {
   realized_gains_sheltered: string;
   total_dividends: string;
   total_fees: string;
+  /** fills behind these figures that were entered for a date already past */
+  backdated_fills: number;
   accounts: AccountT[];
 }
 
@@ -357,6 +360,87 @@ export interface DividendT {
   amount: string;
 }
 
+/** One row of the month-by-month performance table. The row balances exactly:
+ *  ending_balance = beginning_balance + net_cash_flow + market_gain + income. */
+export interface MonthPerformanceT {
+  month: string;               // "2026-08"
+  beginning_balance: string;
+  net_cash_flow: string;       // deposits and withdrawals, signed
+  market_gain: string;
+  income: string;              // dividends and settlement-fund interest
+  personal_return: string;     // market_gain + income
+  cumulative_return: string;   // running sum of personal_return since inception
+  ending_balance: string;
+  backdated_fills: number;
+}
+
+/** One thing that happened inside a month — the drill-down behind a row. */
+export interface MonthEventT {
+  date: string;
+  kind: "CONTRIBUTION" | "WITHDRAWAL" | "ROLLOVER" | "BUY" | "SELL" | "DIVIDEND";
+  account: string;
+  description: string;
+  amount: string;
+  backdated: boolean;
+}
+
+/** What a Roth conversion would cost, before it is done. */
+export interface ConversionPreviewT {
+  from_account_id: string;
+  to_account_id: string;
+  conversion_date: string;
+  gross_amount: string;
+  taxable_amount: string;      // ordinary income in the conversion year
+  nontaxable_amount: string;   // after-tax basis, prorated per Form 8606
+  basis_fraction_pct: number;
+  total_pre_tax_value: string;
+  total_after_tax_basis: string;
+  ticker: string | null;
+  shares: string;
+  price: string;
+  in_kind: boolean;
+  five_year_clock_year: number;
+  notes: string[];
+}
+
+export interface ConversionT {
+  id: string;
+  from_account_id: string;
+  to_account_id: string;
+  conversion_date: string;
+  gross_amount: string;
+  taxable_amount: string;
+  nontaxable_amount: string;
+  taxable_remaining: string;
+  nontaxable_remaining: string;
+  in_kind: boolean;
+  created_at: string;
+}
+
+export interface ConversionResultT {
+  conversion: ConversionT;
+  from_account: AccountT;
+  to_account: AccountT;
+  notes: string[];
+}
+
+/** One layer of a distribution under the IRA ordering rules. */
+export interface WithdrawalLayerT {
+  label: string;
+  amount: string;
+  taxable: string;
+  penalty: string;
+}
+
+export interface WithdrawalPlanT {
+  gross: string;
+  layers: WithdrawalLayerT[];
+  taxable_income: string;
+  penalty: string;
+  qualified: boolean;
+  notes: string[];
+}
+
 export interface MarketStatusT {
   is_open: boolean;
   is_trading_day: boolean;
@@ -366,6 +450,12 @@ export interface MarketStatusT {
   /** past-dated ("as of") fills; off unless ALLOW_BACKDATED_TRADES is set */
   allow_backdated_trades: boolean;
   server_time: string;
+  /** how often to re-price right now, in seconds; 0 = don't poll (market shut) */
+  refresh_seconds: number;
+  /** why: open | nav | closed | off */
+  refresh_reason: "open" | "nav" | "closed" | "off";
+  /** server-side quote cache lifetime — the floor on how fresh a refetch can be */
+  quote_cache_seconds: number;
 }
 
 export type CostBasisMethodT = "FIFO" | "LIFO" | "HIFO" | "MIN_TAX" | "AVERAGE" | "SPEC_ID";
@@ -477,6 +567,10 @@ export interface TaxReportT {
   roth_withdrawals: string;
   ira_contributions: string;
   rollovers: string;
+  conversions: string;              // gross moved into a Roth this year
+  conversion_taxable: string;       // the part that is ordinary income
+  early_withdrawal_penalty: string; // 10% additional tax, where not excepted
+  after_tax_basis: string;          // Form 8606 basis still on the pre-tax side
   notes: string[];
 }
 
@@ -582,6 +676,11 @@ export interface ScenarioT {
   account_count: number;
   is_default: boolean;
   is_active: boolean;
+  /** whether this track accepts past-dated ("as of") fills */
+  allow_backdated: boolean;
+  /** how many past-dated fills it already contains — turning the setting back
+   *  off stops new ones, it does not un-mark the ones already made */
+  backdated_fills: number;
   created_at: string;
 }
 
@@ -608,6 +707,8 @@ export interface MeT {
   full_name: string;
   date_of_birth: string;
   mfa_enabled: boolean;
+  /** opt-in passwordless: the password sign-in path is refused for this account */
+  passkey_only: boolean;
   email_verified: boolean;
   default_range: RangeT;
   default_scenario_id: string | null;

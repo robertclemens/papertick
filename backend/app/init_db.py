@@ -8,12 +8,13 @@ python -m app.init_db
 
 import enum
 import logging
+import os
 import sys
 import time
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import inspect, select, text
+from sqlalchemy import UniqueConstraint, inspect, select, text
 
 from app.config import get_settings
 from app.db import Base, get_engine, get_sessionmaker
@@ -31,7 +32,7 @@ from app.models import (
     User,
 )
 from app import security
-from app.services import settlement
+from app.services import scenarios as scenario_service, settlement
 
 log = logging.getLogger("papertick.init")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -92,6 +93,16 @@ COLUMN_RENAMES = [
     ("option_transactions", "realized_pnl", "realized_gains"),
 ]
 
+# Columns whose feature was removed. Dropped rather than left behind, because a
+# stale column that no model reads is indistinguishable from one that is simply
+# broken, and the next reader has no way to tell which.
+# (table, column)
+COLUMN_DROPS = [
+    # A purchase is paid for from the settlement fund and pulls in what it is
+    # short; there was never a second behaviour for this to select between.
+    ("accounts", "allow_external_funding"),
+]
+
 
 def wait_for_db(timeout_seconds: int = 90) -> None:
     engine = get_engine()
@@ -119,6 +130,20 @@ def apply_renames(engine) -> None:
             if old in cols and new not in cols:
                 conn.execute(text(f'ALTER TABLE {table} RENAME COLUMN "{old}" TO "{new}"'))
                 log.info("schema: renamed %s.%s -> %s", table, old, new)
+
+
+def apply_drops(engine) -> None:
+    """Drop columns whose feature was removed (idempotent)."""
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table, column in COLUMN_DROPS:
+            if not insp.has_table(table):
+                continue
+            if column not in {c["name"] for c in insp.get_columns(table)}:
+                continue
+            # DDL templating over a literal list defined above, not user input.
+            conn.execute(text(f'ALTER TABLE {table} DROP COLUMN "{column}"'))
+            log.info("schema: dropped %s.%s", table, column)
 
 
 def ensure_enum_values(engine) -> None:
@@ -159,8 +184,13 @@ def _sql_default(col) -> str | None:
     return None
 
 
-def ensure_schema(engine) -> None:
-    """Add columns the models define but existing tables lack (idempotent)."""
+def ensure_schema(engine) -> set[tuple[str, str]]:
+    """Add columns the models define but existing tables lack (idempotent).
+
+    Returns the (table, column) pairs actually added, so a caller can run a
+    one-time backfill for a new column without re-running it on every boot.
+    """
+    added: set[tuple[str, str]] = set()
     insp = inspect(engine)
     with engine.begin() as conn:
         for table in Base.metadata.sorted_tables:
@@ -180,7 +210,9 @@ def ensure_schema(engine) -> None:
                     else:
                         ddl += f" DEFAULT {default} NOT NULL"
                 conn.execute(text(ddl))
+                added.add((table.name, col.name))
                 log.info("schema: added %s.%s", table.name, col.name)
+    return added
 
 
 def ensure_check_constraints(engine) -> None:
@@ -235,6 +267,64 @@ def ensure_check_constraints(engine) -> None:
                 f"ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({expr})"
             ))
             log.info("schema: constraint %s in place", name)
+
+
+def ensure_unique_constraints(engine) -> None:
+    """Reconcile UNIQUE constraints with what the models now declare.
+
+    `create_all` builds constraints only for tables it creates, so a
+    constraint whose columns changed after a table already existed drifts
+    silently and stays wrong forever. That is not theoretical: `statements`
+    was created before scenarios existed, so its unique key was
+    (user_id, kind, period_start). Once one user could own several scenarios,
+    that key made a month's statement exclusive across the whole account —
+    every scenario after the first failed to generate statements at all, with
+    the error swallowed by the caller's exception handler.
+
+    Comparing the live definition against the model and rebuilding on a
+    mismatch is cheap and idempotent, and it catches the next drift too.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if not insp.has_table(table.name):
+                continue
+            wanted = {
+                c.name: [col.name for col in c.columns]
+                for c in table.constraints
+                if isinstance(c, UniqueConstraint) and c.name
+            }
+            if not wanted:
+                continue
+            existing = {
+                uc["name"]: list(uc["column_names"])
+                for uc in insp.get_unique_constraints(table.name)
+            }
+            for name, columns in wanted.items():
+                if existing.get(name) == columns:
+                    continue
+                if name in existing:
+                    log.warning("schema: %s.%s is %s, model wants %s — rebuilding",
+                                table.name, name, existing[name], columns)
+                    # Constraint and column names are model literals, never
+                    # request data: DDL templating, not injection.
+                    conn.execute(text(
+                        f"ALTER TABLE {table.name} DROP CONSTRAINT IF EXISTS {name}"
+                    ))
+                cols = ", ".join(f'"{c}"' for c in columns)
+                try:
+                    conn.execute(text(
+                        f"ALTER TABLE {table.name} ADD CONSTRAINT {name} UNIQUE ({cols})"
+                    ))
+                    log.info("schema: unique %s(%s) in place", name, ", ".join(columns))
+                except Exception:
+                    # Duplicate rows under the *new*, narrower key would block
+                    # this. Leaving the table without the constraint is worse
+                    # than loud: log it so it is fixed deliberately.
+                    log.exception("schema: could not apply unique %s on %s",
+                                  name, table.name)
 
 
 def backfill_scenarios(db) -> None:
@@ -351,25 +441,73 @@ def seed() -> None:
             existing = db.execute(select(User).where(User.email == s.demo_email.lower())).first()
             if existing is None:
                 security.validate_password_strength(s.demo_password)
-                db.add(User(
+                demo_user = User(
                     email=s.demo_email.lower(),
                     password_hash=security.hash_password(s.demo_password),
                     date_of_birth=date(1990, 1, 15),
-                ))
+                )
+                db.add(demo_user)
+                db.flush()
+                # seeded after backfill_scenarios has already run, so give it
+                # its scenario directly rather than waiting for the next boot
+                scenario_service.ensure_default(db, demo_user)
                 db.commit()
                 log.info("seeded demo user %s", s.demo_email)
     finally:
         db.close()
 
 
+def backfill_backdated(engine, added: set[tuple[str, str]]) -> None:
+    """One-time backfill for the columns that replaced ALLOW_BACKDATED_TRADES.
+
+    Past-dated fills used to be gated by a single deployment-wide env var and
+    identified only by comparing two columns. They are now a per-scenario
+    setting and a stored flag, so an existing database needs its history
+    stamped and its scenarios set — otherwise an upgrade silently revokes what
+    every existing track was allowed to do.
+    """
+    if ("transactions", "backdated") in added:
+        # the order carries the intent; the transaction's own as_of also moves
+        # for mutual-fund forward pricing, which is not backdating
+        with engine.begin() as conn:
+            n = conn.execute(text(
+                "UPDATE transactions t SET backdated = true "
+                "FROM orders o WHERE o.id = t.order_id AND o.as_of IS NOT NULL"
+            )).rowcount
+        log.info("schema: stamped %d past-dated transaction(s)", n)
+
+    if ("scenarios", "allow_backdated") in added:
+        # A scenario that already contains past-dated fills was self-evidently
+        # permitted to make them, so it is enabled on the strength of its own
+        # history. That is deliberately not "read the retired env var": the
+        # variable stopped being passed into the container in the same change
+        # that removed it, so it cannot be relied on to arrive. It is still
+        # honoured as a secondary signal for a track that has no fills yet.
+        legacy = os.environ.get("ALLOW_BACKDATED_TRADES", "").strip().lower()
+        clause = ("id IN (SELECT a.scenario_id FROM accounts a JOIN transactions t "
+                  "ON t.account_id = a.id WHERE t.backdated)")
+        if legacy in ("1", "true", "yes", "on"):
+            clause = "true"
+        with engine.begin() as conn:
+            n = conn.execute(text(
+                f"UPDATE scenarios SET allow_backdated = true WHERE {clause}")).rowcount
+        if n:
+            log.info("schema: past-dated fills are now a per-scenario setting — "
+                     "enabled on %d existing scenario(s) that already contain them; "
+                     "ALLOW_BACKDATED_TRADES can be removed from your .env", n)
+
+
 def main() -> None:
     wait_for_db()
     engine = get_engine()
     apply_renames(engine)
+    apply_drops(engine)
     ensure_enum_values(engine)
-    ensure_schema(engine)
+    added = ensure_schema(engine)
+    backfill_backdated(engine, added)
     Base.metadata.create_all(engine)
     ensure_check_constraints(engine)
+    ensure_unique_constraints(engine)
     seed()
     log.info("database ready")
 

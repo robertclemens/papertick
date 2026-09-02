@@ -285,11 +285,6 @@ def max_funding_plan(db: Session, account: Account, cadence, day_of_week: int | 
     )
     if catchup:
         notes.append("Your limit includes the age-50+ catch-up amount.")
-    if not account.allow_external_funding:
-        notes.append(
-            "External funding is off for this account, so these runs will invest "
-            "cash already in the settlement fund rather than transferring new money in."
-        )
     return MaxFundingPlanOut(
         tax_year=today.year, remaining=remaining, runs=count,
         per_run=per_run, final_run=final_run, total=remaining,

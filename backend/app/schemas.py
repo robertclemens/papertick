@@ -104,21 +104,56 @@ class LoginOut(BaseModel):
     mfa_required: bool = False
     mfa_token: str | None = None
     verification_required: bool = False
+    # set when this browser is unrecognised and the account has no passkey and
+    # no authenticator: redeem `device_token` at /auth/login/device
+    device_verification_required: bool = False
+    device_token: str | None = None
     tokens: TokenPair | None = None
+
+
+class DeviceLoginIn(BaseModel):
+    device_token: str = Field(min_length=8, max_length=256)
+    code: str = Field(min_length=4, max_length=12)
+
+
+class TrustedDeviceOut(ORMModel):
+    id: str
+    label: str
+    last_ip: str | None
+    created_at: datetime
+    last_seen_at: datetime | None
+    expires_at: datetime
+
+
+class PasswordlessIn(BaseModel):
+    """Turning the password path off is a change that outlives the session, so
+    it re-proves the credentials the same way passkey registration does."""
+
+    enabled: bool
+    current_password: str = Field(min_length=1, max_length=512)
+    code: str | None = Field(default=None, max_length=8)
 
 
 class ScenarioCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str | None = Field(default=None, max_length=300)
-    # copies balances and holdings (priced at today's market); trades,
-    # dividends and auto-invest rules are deliberately not copied
     copy_from_id: str | None = Field(default=None, max_length=36)
+    # How much of the source track `copy_from_id` brings across.
+    #   position — balances and holdings only, re-priced at today's market, so
+    #              the new track starts flat. The original behaviour.
+    #   full     — an exact duplicate: every order, transaction, tax lot,
+    #              dividend, contribution and auto-invest rule, so returns and
+    #              history carry over intact.
+    copy_mode: Literal["position", "full"] = "position"
 
 
 class ScenarioUpdateIn(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     description: str | None = Field(default=None, max_length=300)
     is_default: bool = False
+    # None leaves it alone; True/False sets whether this track takes past-dated
+    # ("as of") fills. Turning it off does not un-mark fills already made.
+    allow_backdated: bool | None = None
 
 
 class ScenarioImportIn(BaseModel):
@@ -155,6 +190,9 @@ class ScenarioOut(BaseModel):
     account_count: int
     is_default: bool
     is_active: bool
+    # whether this track accepts past-dated fills, and how many it already has
+    allow_backdated: bool
+    backdated_fills: int
     created_at: datetime
 
 
@@ -171,6 +209,7 @@ class UserOut(ORMModel):
     full_name: str = ""
     date_of_birth: date
     mfa_enabled: bool
+    passkey_only: bool = False
     email_verified: bool
     default_range: RangeKey = "1y"
     default_scenario_id: str | None = None
@@ -304,11 +343,12 @@ class AccountOut(ORMModel):
     settlement_yield: Decimal | None = None      # 7-day SEC yield, annualized
     settlement_accrued: Decimal | None = None    # dividend accrued this month
     cost_basis_method: CostBasisMethod
-    allow_external_funding: bool
     created_at: datetime
     # settlement balance minus short-put collateral and cash committed to open
     # buy orders; there are no settlement holds on swept-in cash
     buying_power: Decimal | None = None
+    # fills in this account that were entered for a date already past
+    backdated_fills: int = 0
     # empty for taxable accounts, which have no annual contribution limit.
     # Between Jan 1 and Tax Day this holds the prior year too, while it still
     # has room — contributions may still be designated to it.
@@ -317,7 +357,6 @@ class AccountOut(ORMModel):
 
 class AccountSettingsIn(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
-    allow_external_funding: bool | None = None
 
 
 class AccountOrderIn(BaseModel):
@@ -330,10 +369,18 @@ class DepositIn(BaseModel):
     amount: Decimal = Field(gt=0, le=MAX_MONEY, decimal_places=2)
     tax_year: int | None = Field(default=None, ge=2000, le=2100)
     kind: Literal["CONTRIBUTION", "ROLLOVER"] = "CONTRIBUTION"
+    # Traditional/Rollover IRA only: this money was contributed after tax, so it
+    # becomes basis and comes back out untaxed (pro-rata). Whether a
+    # contribution is deductible turns on income and workplace-plan coverage
+    # that this platform never sees, so it is declared, exactly as on Form 8606.
+    nondeductible: bool = False
 
 
 class WithdrawIn(BaseModel):
     amount: Decimal = Field(gt=0, le=MAX_MONEY, decimal_places=2)
+    # the account holder attests one of the IRS exceptions to the 10% penalty
+    # applies; the individual exceptions are not modelled
+    penalty_exception: bool = False
 
 
 class ContributionOut(ORMModel):
@@ -343,7 +390,35 @@ class ContributionOut(ORMModel):
     amount: Decimal
     kind: CashFlowKind
     memo: str | None
+    nondeductible: bool = False
+    penalty_exception: bool = False
     timestamp: datetime
+
+
+class WithdrawalLayerOut(BaseModel):
+    """One layer of a distribution under the IRA ordering rules."""
+
+    label: str
+    amount: Decimal
+    taxable: Decimal
+    penalty: Decimal
+
+
+class WithdrawalPlanOut(BaseModel):
+    """What a distribution costs, layer by layer.
+
+    Roth money comes out in a fixed order — regular contributions, then
+    conversions oldest-first, then earnings — and each layer is taxed and
+    penalised differently. Traditional money comes out pro-rata against
+    after-tax basis. Either way the reader gets the split before they commit.
+    """
+
+    gross: Decimal
+    layers: list[WithdrawalLayerOut] = []
+    taxable_income: Decimal = Decimal("0")
+    penalty: Decimal = Decimal("0")
+    qualified: bool = False
+    notes: list[str] = []
 
 
 class CashFlowResultOut(BaseModel):
@@ -351,6 +426,8 @@ class CashFlowResultOut(BaseModel):
     contribution: ContributionOut
     warnings: list[str] = []
     irs: "IrsStatusOut | None" = None
+    # present for IRA withdrawals: what the distribution actually cost
+    plan: WithdrawalPlanOut | None = None
 
 
 class IrsStatusOut(BaseModel):
@@ -381,9 +458,16 @@ class MarketStatusOut(BaseModel):
     next_open: datetime
     next_close: datetime
     enforce_market_hours: bool
-    # off by default: past-dated fills rewrite already-issued statements
+    # whether the caller's ACTIVE SCENARIO accepts past-dated fills; off by
+    # default, because they rewrite already-issued statements
     allow_backdated_trades: bool = False
     server_time: datetime
+    # How often the UI should re-price right now, and why. 0 = do not poll:
+    # outside trading hours nothing it could fetch has changed. `refresh_reason`
+    # is one of open | nav | closed | off, so the UI can say which it is.
+    refresh_seconds: int = 0
+    refresh_reason: str = "off"
+    quote_cache_seconds: int = 30
 
 
 class QuoteOut(BaseModel):
@@ -691,6 +775,44 @@ class PositionOut(BaseModel):
     unrealized_gains_pct: float | None
 
 
+class MonthPerformanceOut(BaseModel):
+    """One month of a Vanguard-style performance table.
+
+    The row balances exactly:
+        ending_balance = beginning_balance + net_cash_flow + market_gain + income
+    `personal_return` is market_gain + income — what the portfolio earned, with
+    deposits and withdrawals taken out of the picture — and `cumulative_return`
+    is the running sum of those since inception, not since the top of the table.
+    """
+
+    month: str                     # "2026-08"
+    beginning_balance: Decimal
+    net_cash_flow: Decimal         # deposits and withdrawals, signed
+    market_gain: Decimal
+    income: Decimal                # dividends and settlement-fund interest
+    personal_return: Decimal
+    cumulative_return: Decimal
+    ending_balance: Decimal
+    # past-dated fills effective in this month: these figures were produced
+    # with the outcome already known
+    backdated_fills: int = 0
+
+
+class MonthlyPerformanceOut(BaseModel):
+    months: list[MonthPerformanceOut]
+
+
+class MonthEventOut(BaseModel):
+    """One thing that happened inside a month — the drill-down behind a row."""
+
+    date: date
+    kind: str          # CONTRIBUTION | WITHDRAWAL | ROLLOVER | BUY | SELL | DIVIDEND
+    account: str
+    description: str
+    amount: Decimal    # signed as it hit the account
+    backdated: bool = False
+
+
 class PortfolioSummaryOut(BaseModel):
     total_value: Decimal
     cash: Decimal
@@ -711,6 +833,12 @@ class PortfolioSummaryOut(BaseModel):
     realized_gains_sheltered: Decimal = Decimal("0")
     total_dividends: Decimal
     total_fees: Decimal
+    # How many of the fills behind these numbers were entered for a date that
+    # had already happened. Scoped exactly like everything else here, so an
+    # account filter narrows it too. Non-zero means the returns above were
+    # produced with hindsight, and the UI says so rather than leaving it to be
+    # discovered in the transaction list.
+    backdated_fills: int = 0
     accounts: list[AccountOut]
 
 
@@ -883,6 +1011,62 @@ class StatementOut(ORMModel):
 
 # ------------------------------------------------------------------ taxes
 
+class ConversionIn(BaseModel):
+    """Convert cash or shares from a Traditional/Rollover IRA into a Roth.
+
+    Give either `amount` (cash) or `ticker` + `shares` (in kind). A conversion
+    has no annual limit and no income cap.
+    """
+
+    to_account_id: str = Field(max_length=36)
+    amount: Decimal | None = Field(default=None, gt=0, le=MAX_MONEY, decimal_places=2)
+    ticker: str | None = Field(default=None, max_length=12)
+    shares: Decimal | None = Field(default=None, gt=0, decimal_places=6)
+    # past-dated conversions follow the same per-scenario gate as trades
+    as_of: date | None = None
+
+
+class ConversionPreviewOut(BaseModel):
+    from_account_id: str
+    to_account_id: str
+    conversion_date: date
+    gross_amount: Decimal
+    taxable_amount: Decimal        # ordinary income in the conversion year
+    nontaxable_amount: Decimal     # after-tax basis, prorated per Form 8606
+    basis_fraction_pct: float
+    total_pre_tax_value: Decimal   # every Traditional + Rollover IRA, combined
+    total_after_tax_basis: Decimal
+    ticker: str | None = None
+    shares: Decimal = Decimal("0")
+    price: Decimal = Decimal("0")
+    in_kind: bool = False
+    five_year_clock_year: int
+    notes: list[str] = []
+
+
+class ConversionOut(BaseModel):
+    id: str
+    from_account_id: str
+    to_account_id: str
+    conversion_date: date
+    gross_amount: Decimal
+    taxable_amount: Decimal
+    nontaxable_amount: Decimal
+    taxable_remaining: Decimal
+    nontaxable_remaining: Decimal
+    in_kind: bool
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ConversionResultOut(BaseModel):
+    conversion: ConversionOut
+    from_account: AccountOut
+    to_account: AccountOut
+    notes: list[str] = []
+
+
 class TaxYearSummaryOut(BaseModel):
     year: int
     account_id: str | None
@@ -897,6 +1081,13 @@ class TaxYearSummaryOut(BaseModel):
     roth_withdrawals: Decimal
     ira_contributions: Decimal        # designated to this tax year
     rollovers: Decimal
+    # Roth conversions: gross moved, and the part that is ordinary income
+    conversions: Decimal = Decimal("0")
+    conversion_taxable: Decimal = Decimal("0")
+    # 10% additional tax on early distributions, where it was not excepted
+    early_withdrawal_penalty: Decimal = Decimal("0")
+    # after-tax basis still sitting in Traditional/Rollover IRAs (Form 8606)
+    after_tax_basis: Decimal = Decimal("0")
     notes: list[str]
 
 

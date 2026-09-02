@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
+  AccountT,
   api,
   ApiError,
   DividendT,
@@ -27,9 +28,17 @@ const DATE_FIELD: Record<Tab, string> = {
   dividends: "ex-date",
 };
 
+/** "all", or an account id. Kept out of the fetch: every row already carries
+ *  its account_id, so filtering client-side keeps the tab switch instant and
+ *  the row cap honest — the cap applies to the whole scenario either way, so
+ *  narrowing after the fetch never hides rows a narrowed fetch would show. */
+type AccountFilter = string;
+
 export default function HistoryPage() {
   const [tab, setTab] = useState<Tab>("orders");
   const [range, setRange] = useRangePref();
+  const [accountId, setAccountId] = useState<AccountFilter>("all");
+  const [accounts, setAccounts] = useState<AccountT[] | null>(null);
   const [orders, setOrders] = useState<OrderT[] | null>(null);
   const [txns, setTxns] = useState<TransactionT[] | null>(null);
   const [divs, setDivs] = useState<DividendT[] | null>(null);
@@ -45,9 +54,19 @@ export default function HistoryPage() {
 
   useEffect(() => {
     loadOrders();
+    api<AccountT[]>("/accounts").then(setAccounts).catch(() => setAccounts([]));
     api<TransactionT[]>(`/transactions?limit=${ORDER_CAP}`).then(setTxns).catch(() => setTxns([]));
     api<DividendT[]>(`/portfolio/dividends?limit=${DIVIDEND_CAP}`).then(setDivs).catch(() => setDivs([]));
   }, []);
+
+  /** id -> display name, so every row can name the bucket it happened in. */
+  const accountName = useMemo(() => {
+    const map = new Map<string, string>();
+    (accounts ?? []).forEach((a) => map.set(a.id, a.name));
+    return (id: string) => map.get(id) ?? "—";
+  }, [accounts]);
+
+  const inAccount = (id: string) => accountId === "all" || id === accountId;
 
   async function cancel(id: string) {
     try {
@@ -57,11 +76,14 @@ export default function HistoryPage() {
   }
 
   const shownOrders = useMemo(
-    () => (orders ?? []).filter((o) => !range || withinRange(o.created_at, range)), [orders, range]);
+    () => (orders ?? []).filter((o) => inAccount(o.account_id) && (!range || withinRange(o.created_at, range))),
+    [orders, range, accountId]);
   const shownTxns = useMemo(
-    () => (txns ?? []).filter((t) => !range || withinRange(t.executed_at, range)), [txns, range]);
+    () => (txns ?? []).filter((t) => inAccount(t.account_id) && (!range || withinRange(t.executed_at, range))),
+    [txns, range, accountId]);
   const shownDivs = useMemo(
-    () => (divs ?? []).filter((d) => !range || withinRange(d.event_date, range)), [divs, range]);
+    () => (divs ?? []).filter((d) => inAccount(d.account_id) && (!range || withinRange(d.event_date, range))),
+    [divs, range, accountId]);
 
   const loaded = { orders, transactions: txns, dividends: divs }[tab];
   const rowCount = { orders: shownOrders, transactions: shownTxns, dividends: shownDivs }[tab].length;
@@ -72,7 +94,10 @@ export default function HistoryPage() {
     setExportError("");
     setExporting(fmt);
     try {
-      await download(`/export/${tab}.${fmt}?range=${range ?? "1y"}`, `papertick-${tab}.${fmt}`);
+      // the export mirrors what is on screen, account filter included
+      const scope = accountId === "all" ? "" : `&account_id=${encodeURIComponent(accountId)}`;
+      await download(`/export/${tab}.${fmt}?range=${range ?? "1y"}${scope}`,
+                     `papertick-${tab}.${fmt}`);
     } catch (err) {
       setExportError(err instanceof ApiError ? err.message : "Export failed");
     } finally {
@@ -115,9 +140,21 @@ export default function HistoryPage() {
                 </button>
               ))}
             </div>
+            <select
+              className="input !w-auto !py-1 text-xs"
+              aria-label="Filter by account"
+              value={accountId}
+              onChange={(e) => setAccountId(e.target.value)}
+            >
+              <option value="all">All accounts</option>
+              {(accounts ?? []).map((a) => (
+                <option key={a.id} value={a.id}>{a.name}</option>
+              ))}
+            </select>
             <span className="text-xs text-slate-500">
               {rowCount} {rowCount === 1 ? "row" : "rows"}
               {range && ` · ${RANGE_LABEL[range].toLowerCase()}`} by {DATE_FIELD[tab]}
+              {accountId !== "all" && ` · ${accountName(accountId)}`}
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -146,20 +183,21 @@ export default function HistoryPage() {
           {!orders ? (
             <Spinner />
           ) : shownOrders.length === 0 ? (
-            <Empty>No orders in this timeframe.</Empty>
+            <Empty>No orders in this timeframe{accountId !== "all" ? ` for ${accountName(accountId)}` : ""}.</Empty>
           ) : (
             <div className="overflow-x-auto">
               <table className="table-base">
                 <thead>
                   <tr>
-                    <th>Placed</th><th>Side</th><th>Ticker</th><th>Type</th><th>Quantity</th>
-                    <th>Status</th><th>Detail</th><th></th>
+                    <th>Placed</th><th>Account</th><th>Side</th><th>Ticker</th><th>Type</th>
+                    <th>Quantity</th><th>Status</th><th>Detail</th><th></th>
                   </tr>
                 </thead>
                 <tbody>
                   {shownOrders.map((o) => (
                     <tr key={o.id}>
                       <td className="whitespace-nowrap">{dateTime(o.created_at)}</td>
+                      <td className="whitespace-nowrap text-xs text-slate-400">{accountName(o.account_id)}</td>
                       <td><Badge value={o.side} /></td>
                       <td className="font-medium">{o.ticker}</td>
                       <td className="text-xs text-slate-400">
@@ -201,12 +239,16 @@ export default function HistoryPage() {
             <div className="overflow-x-auto">
               <table className="table-base">
                 <thead>
-                  <tr><th>Ex-date</th><th>Ticker</th><th>Per share</th><th>Shares held</th><th>Amount</th></tr>
+                  <tr>
+                    <th>Ex-date</th><th>Account</th><th>Ticker</th><th>Per share</th>
+                    <th>Shares held</th><th>Amount</th>
+                  </tr>
                 </thead>
                 <tbody>
                   {shownDivs.map((d) => (
                     <tr key={d.id}>
                       <td>{shortDate(d.event_date)}</td>
+                      <td className="whitespace-nowrap text-xs text-slate-400">{accountName(d.account_id)}</td>
                       <td className="font-medium">{d.ticker}</td>
                       <td>{money(d.per_share, 4)}</td>
                       <td>{shares(d.shares)}</td>
@@ -223,13 +265,13 @@ export default function HistoryPage() {
           {!txns ? (
             <Spinner />
           ) : shownTxns.length === 0 ? (
-            <Empty>No transactions in this timeframe.</Empty>
+            <Empty>No transactions in this timeframe{accountId !== "all" ? ` for ${accountName(accountId)}` : ""}.</Empty>
           ) : (
             <div className="overflow-x-auto">
               <table className="table-base">
                 <thead>
                   <tr>
-                    <th>Executed</th><th>Effective</th><th>Side</th><th>Ticker</th>
+                    <th>Executed</th><th>Effective</th><th>Account</th><th>Side</th><th>Ticker</th>
                     <th>Shares</th><th>Price</th><th>Amount</th><th>Fees</th><th>Realized gains</th>
                   </tr>
                 </thead>
@@ -238,6 +280,7 @@ export default function HistoryPage() {
                     <tr key={t.id}>
                       <td className="whitespace-nowrap text-xs">{dateTime(t.executed_at)}</td>
                       <td>{shortDate(t.as_of)}</td>
+                      <td className="whitespace-nowrap text-xs text-slate-400">{accountName(t.account_id)}</td>
                       <td><Badge value={t.side} /></td>
                       <td className="font-medium">{t.ticker}</td>
                       <td>{shares(t.shares_filled)}</td>

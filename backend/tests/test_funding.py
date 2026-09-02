@@ -1,4 +1,11 @@
-"""Buying power, committed cash, and external-bank auto-funding."""
+"""Buying power, committed cash, and external-bank funding.
+
+Every purchase is paid for out of the settlement fund and pulls in whatever it
+is short — the platform cannot see what you hold elsewhere, so it reads the
+order as a statement that the money exists. The only refusals left are the ones
+the IRS imposes: an IRA stops at its annual limit, and a Rollover IRA takes no
+regular contribution at all.
+"""
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -30,30 +37,29 @@ def _buy(account_id, amount="1000", **kw):
 
 # ---------------------------------------------------------------- committed cash
 
-def test_queued_order_commits_its_cash(db, taxable, enforce_hours):
+def test_queued_order_commits_its_cash(db, rollover, enforce_hours):
     """The reported bug: a queued order must earmark its cash so a second
-    order cannot spend the same dollars."""
-    taxable.settlement_balance = Decimal("8600")
-    taxable.allow_external_funding = False
+    order cannot spend the same dollars. Uses the one account that cannot
+    cover the second order by pulling more cash in."""
+    rollover.settlement_balance = Decimal("8600")
     db.commit()
 
     order1, txn1 = trading.place_order(
-        db, taxable, _buy(taxable.id, "8600"), OrderSource.API, now=SATURDAY
+        db, rollover, _buy(rollover.id, "8600"), OrderSource.API, now=SATURDAY
     )
     assert order1.status == OrderStatus.SCHEDULED and txn1 is None
-    assert trading.committed_cash(db, taxable.id) == Decimal("8600.00")
-    assert trading.buying_power(db, taxable.id) == Decimal("0.00")
+    assert trading.committed_cash(db, rollover.id) == Decimal("8600.00")
+    assert trading.buying_power(db, rollover.id) == Decimal("0.00")
 
     with pytest.raises(HTTPException) as exc:
-        trading.place_order(db, taxable, _buy(taxable.id, "3333"), OrderSource.API, now=SATURDAY)
+        trading.place_order(db, rollover, _buy(rollover.id, "3333"), OrderSource.API, now=SATURDAY)
     assert exc.value.status_code == 422
     assert "already committed to open orders" in exc.value.detail
-    assert Decimal(taxable.settlement_balance) == Decimal("8600")  # untouched
+    assert Decimal(rollover.settlement_balance) == Decimal("8600")  # untouched
 
 
 def test_cancelling_an_order_frees_its_cash(db, taxable, enforce_hours):
     taxable.settlement_balance = Decimal("5000")
-    taxable.allow_external_funding = False
     db.commit()
     order, _ = trading.place_order(
         db, taxable, _buy(taxable.id, "5000"), OrderSource.API, now=SATURDAY
@@ -65,8 +71,6 @@ def test_cancelling_an_order_frees_its_cash(db, taxable, enforce_hours):
 
 
 def test_share_orders_commit_estimated_cost(db, taxable, enforce_hours):
-    taxable.allow_external_funding = False
-    db.commit()
     price = trading.market_data.quote("VOO").price
     trading.place_order(
         db, taxable,
@@ -94,13 +98,15 @@ def test_taxable_order_pulls_external_funds(db, taxable):
     assert Decimal(taxable.settlement_balance) == Decimal("0.00")  # all cash deployed
 
 
-def test_funding_disabled_blocks_the_order(db, taxable):
-    taxable.settlement_balance = Decimal("100")
-    taxable.allow_external_funding = False
+def test_rollover_ira_cannot_pull_cash_in(db, rollover):
+    """A transfer into a Rollover IRA would be a regular contribution, which
+    the account type does not accept — so a short purchase is refused rather
+    than funded."""
+    rollover.settlement_balance = Decimal("100")
     db.commit()
     with pytest.raises(HTTPException) as exc:
-        trading.place_order(db, taxable, _buy(taxable.id, "5000"), OrderSource.API)
-    assert "External funding is turned off" in exc.value.detail
+        trading.place_order(db, rollover, _buy(rollover.id, "5000"), OrderSource.API)
+    assert "Rollover IRA" in exc.value.detail
     assert db.query(Contribution).count() == 0
 
 

@@ -48,6 +48,12 @@ class CashFlowKind(str, enum.Enum):
     CONTRIBUTION = "CONTRIBUTION"
     ROLLOVER = "ROLLOVER"
     WITHDRAWAL = "WITHDRAWAL"
+    # A Roth conversion, written as a signed pair: negative out of the
+    # Traditional/Rollover IRA, positive into the Roth. Deliberately its own
+    # kind rather than a withdrawal plus a contribution, because a conversion
+    # has no annual limit and no income cap — treating it as a contribution
+    # would have it consume IRA room it does not consume.
+    CONVERSION = "CONVERSION"
 
 
 class AssetClass(str, enum.Enum):
@@ -177,6 +183,11 @@ class User(Base):
     date_of_birth: Mapped[date] = mapped_column(Date)
     mfa_secret_enc: Mapped[str | None] = mapped_column(String(512), default=None)
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Opt-in passwordless: when set, this account signs in with a passkey only
+    # and the password path is refused. Guarded at the point of enabling — it
+    # needs two registered passkeys, so losing one authenticator is not a
+    # lockout. The password hash is kept so the switch can be turned back off.
+    passkey_only: Mapped[bool] = mapped_column(Boolean, default=False)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # preferred performance window (see PERFORMANCE_RANGES)
@@ -209,6 +220,59 @@ class WebAuthnCredential(Base):
     nickname: Mapped[str] = mapped_column(String(100), default="Passkey")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class TrustedDevice(Base):
+    """A browser this user has already signed in from successfully.
+
+    Only consulted for accounts with no passkey and no authenticator, and only
+    in production: it is the fallback second factor, not an extra one. The
+    cookie carries a random secret; only its SHA-256 lands here, so a database
+    read does not yield a usable device token.
+    """
+
+    __tablename__ = "trusted_devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    label: Mapped[str] = mapped_column(String(120), default="Unknown device")
+    # coarse only: enough for the user to recognise the row, never a fingerprint
+    last_ip: Mapped[str | None] = mapped_column(String(45), default=None)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SplitApplication(Base):
+    """One split, applied once to one account's holding of one security.
+
+    Splits are permanent facts, but applying one is destructive — it rewrites
+    every open lot's share count and per-share basis — so it must happen
+    exactly once. The unique key is what guarantees that: a second attempt for
+    the same (account, ticker, ex-date) is refused by the database rather than
+    silently doubling the position.
+
+    The before/after share counts are kept because this is the one ledger
+    mutation with no order behind it, and an unexplained change in share count
+    is precisely what someone auditing the account would want traced.
+    """
+
+    __tablename__ = "split_applications"
+    __table_args__ = (
+        UniqueConstraint("account_id", "ticker", "event_date", name="uq_split_applied"),
+        Index("ix_splits_account_ticker", "account_id", "ticker"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    ticker: Mapped[str] = mapped_column(String(12))
+    event_date: Mapped[date] = mapped_column(Date)
+    ratio: Mapped[object] = mapped_column(Numeric(18, 8))
+    shares_before: Mapped[object] = mapped_column(Numeric(24, 6))
+    shares_after: Mapped[object] = mapped_column(Numeric(24, 6))
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class RefreshToken(Base):
@@ -258,6 +322,12 @@ class Scenario(Base):
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     # where the holdings came from, for a scenario copied off another
     copied_from_id: Mapped[str | None] = mapped_column(String(36), default=None)
+    # Whether this track accepts past-dated ("as of") fills. Off by default:
+    # a backdated order is placed knowing the outcome, and it rewrites periods
+    # that already have statements. It is a per-scenario choice rather than a
+    # deployment-wide one because a scenario is exactly the place to run a
+    # hypothesis you already know the answer to — as long as it says so.
+    allow_backdated: Mapped[bool] = mapped_column(Boolean, default=False)
     # Soft delete: the scenario and everything in it stay put for a retention
     # window so a mistaken click is recoverable, then a beat task wipes them.
     # A deleted scenario is frozen — it cannot be selected and its schedules,
@@ -301,9 +371,16 @@ class Account(Base):
     cost_basis_method: Mapped[CostBasisMethod] = mapped_column(
         SAEnum(CostBasisMethod), default=CostBasisMethod.FIFO
     )
+    # After-tax ("basis") money in a Traditional or Rollover IRA: nondeductible
+    # contributions, and after-tax dollars rolled in from an employer plan. It
+    # is what makes a conversion partly tax-free, and the only reason the
+    # platform can model a backdoor Roth honestly. Tracked because it is
+    # elected, not inferred: whether a contribution was deductible depends on
+    # income and workplace-plan coverage that this app never sees, so the user
+    # declares it exactly as they would on Form 8606.
+    after_tax_basis: Mapped[object] = mapped_column(Numeric(18, 2), default=0)
     # When on, a trade short of cash pulls the shortfall from the linked
     # external bank (subject to IRS contribution limits in IRAs).
-    allow_external_funding: Mapped[bool] = mapped_column(Boolean, default=True)
     # user-chosen display order (drag and drop); ties break on created_at
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -327,7 +404,47 @@ class Contribution(Base):
     amount: Mapped[object] = mapped_column(Numeric(18, 2))
     kind: Mapped[CashFlowKind] = mapped_column(SAEnum(CashFlowKind))
     memo: Mapped[str | None] = mapped_column(String(200), default=None)
+    # Traditional/Rollover IRA contributions only: the user elected to make this
+    # one nondeductible, so it adds to the account's after-tax basis.
+    nondeductible: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Withdrawals only: the user attests one of the IRS exceptions to the 10%
+    # early-distribution penalty applies (first home, disability, higher
+    # education, substantially equal payments, and the rest). The individual
+    # exceptions are not modelled — each needs facts the app cannot see — so
+    # this records the claim and suppresses the penalty.
+    penalty_exception: Mapped[bool] = mapped_column(Boolean, default=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Conversion(Base):
+    """One Roth conversion, with the pre-tax/after-tax split it was taxed on.
+
+    A separate table rather than a flag on Contribution because Roth withdrawal
+    ordering has to walk conversions oldest-first *carrying their taxable
+    split*: converted pre-tax money and converted after-tax money come out in
+    that order and are penalised differently. That is three facts per
+    conversion, which does not fit on a cash-flow row.
+
+    Each conversion also starts its own five-year clock, which is why the date
+    is kept here and not merely implied by the contribution timestamp.
+    """
+
+    __tablename__ = "conversions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    from_account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    to_account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    # the date the conversion was effective; its 5-year clock starts on Jan 1
+    # of this date's year, not on the date itself
+    conversion_date: Mapped[date] = mapped_column(Date, index=True)
+    gross_amount: Mapped[object] = mapped_column(Numeric(18, 2))
+    taxable_amount: Mapped[object] = mapped_column(Numeric(18, 2))
+    nontaxable_amount: Mapped[object] = mapped_column(Numeric(18, 2))
+    # how much of each part is still inside the Roth, for withdrawal ordering
+    taxable_remaining: Mapped[object] = mapped_column(Numeric(18, 2))
+    nontaxable_remaining: Mapped[object] = mapped_column(Numeric(18, 2))
+    in_kind: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Asset(Base):
@@ -407,6 +524,14 @@ class Transaction(Base):
     realized_lt: Mapped[object | None] = mapped_column(Numeric(18, 2), default=None)  # long-term portion
     as_of: Mapped[date] = mapped_column(Date)  # effective market date of the fill
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # True when the user asked for a past date (`Order.as_of`), copied down from
+    # the order so a query never has to join to find out. Deliberately NOT
+    # `as_of != executed_at::date`: a mutual fund fills at a prior day's NAV as
+    # a matter of forward pricing, and an expiry assignment processed late is
+    # stamped at expiry — neither is someone trading on hindsight. Stored and
+    # indexed because "does this book contain past-dated fills" is asked on
+    # every dashboard, account and performance render.
+    backdated: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 class RecurringRule(Base):

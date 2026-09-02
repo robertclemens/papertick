@@ -7,6 +7,7 @@ import { useScenarios } from "@/components/scenario-context";
 import { dateTime, shortDate } from "@/lib/format";
 import { passkeysSupported, registerPasskey } from "@/lib/webauthn";
 import { Badge, Card, Dialog, Empty, ErrorText, InfoText, Spinner } from "@/components/ui";
+import ApiKeysCard from "@/components/api-keys";
 
 interface PasskeyT {
   id: string;
@@ -15,6 +16,20 @@ interface PasskeyT {
   created_at: string;
   last_used_at: string | null;
 }
+
+/** A browser that has cleared the new-device email check and may skip it. */
+interface DeviceT {
+  id: string;
+  label: string;
+  last_ip: string | null;
+  created_at: string;
+  last_seen_at: string | null;
+  expires_at: string;
+}
+
+/** Passwordless needs a spare authenticator; the server enforces the same
+ *  floor, this just keeps the button from promising something it can't do. */
+const MIN_PASSWORDLESS_KEYS = 2;
 
 /** base64 for a data: URI, unicode-safe (btoa alone throws on non-Latin-1). */
 function qrDataUri(svg: string): string {
@@ -64,11 +79,19 @@ export default function SettingsPage() {
   const [pkError, setPkError] = useState("");
   const [mfaPassword, setMfaPassword] = useState("");
 
+  // passwordless + remembered devices
+  const [pwlDialog, setPwlDialog] = useState(false);
+  const [pwlPassword, setPwlPassword] = useState("");
+  const [pwlCode, setPwlCode] = useState("");
+  const [pwlError, setPwlError] = useState("");
+  const [devices, setDevices] = useState<DeviceT[] | null>(null);
+
   const [busy, setBusy] = useState(false);
 
   function load() {
     api<MeT>("/auth/me").then(setMe).catch(() => {});
     api<PasskeyT[]>("/auth/passkeys").then(setPasskeys).catch(() => setPasskeys([]));
+    api<DeviceT[]>("/auth/devices").then(setDevices).catch(() => setDevices([]));
   }
   useEffect(load, []);
 
@@ -220,7 +243,55 @@ export default function SettingsPage() {
   }
 
   async function removePasskey(id: string) {
-    await api(`/auth/passkeys/${id}`, { method: "DELETE" }).catch(() => {});
+    try {
+      await api(`/auth/passkeys/${id}`, { method: "DELETE" });
+      setPkError("");
+    } catch (err) {
+      // the server refuses a removal that would strip a passwordless account
+      // back to a single authenticator — that reason needs to be visible
+      setPkError(err instanceof ApiError ? err.message : "Failed to remove passkey");
+    }
+    load();
+  }
+
+  // -------------------------------------------------- passwordless / devices
+
+  async function setPasswordless(e: FormEvent) {
+    e.preventDefault();
+    if (!me) return;
+    setPwlError("");
+    setBusy(true);
+    try {
+      await api("/auth/passkeys/passwordless", {
+        method: "POST",
+        body: {
+          enabled: !me.passkey_only,
+          current_password: pwlPassword,
+          code: pwlCode || null,
+        },
+      });
+      setPwlDialog(false);
+      setPwlPassword("");
+      setPwlCode("");
+      setNotice(me.passkey_only
+        ? "Password sign-in is back on for this account."
+        : "Password sign-in is off — this account now signs in with a passkey.");
+      load();
+    } catch (err) {
+      setPwlError(err instanceof ApiError ? err.message : "Failed to change sign-in method");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function forgetDevice(id: string) {
+    await api(`/auth/devices/${id}`, { method: "DELETE" }).catch(() => {});
+    load();
+  }
+
+  async function forgetAllDevices() {
+    await api("/auth/devices", { method: "DELETE" }).catch(() => {});
+    setNotice("Every remembered browser will need a fresh code next time.");
     load();
   }
 
@@ -281,7 +352,8 @@ export default function SettingsPage() {
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
         <p className="mt-1 text-sm text-slate-400">
-          Profile and sign-in security. MFA is optional — add a passkey, an authenticator app, both, or neither.
+          Profile, sign-in security, and the API keys that let CLI tools and agents reach this
+          account. MFA is optional — add a passkey, an authenticator app, both, or neither.
         </p>
       </header>
 
@@ -422,10 +494,87 @@ export default function SettingsPage() {
                 ))}
               </ul>
             )}
+            <ErrorText>{pkError}</ErrorText>
             <button className="btn-primary" onClick={() => { setPkDialog(true); setPkError(""); }}>
               Add passkey
             </button>
+
+            <div className="mt-5 border-t border-slate-800 pt-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-sm font-medium text-slate-200">
+                    Password sign-in
+                    {me.passkey_only && <Badge value="OFF" />}
+                  </div>
+                  <p className="mt-1 max-w-prose text-xs text-slate-500">
+                    {me.passkey_only
+                      ? "This account signs in with a passkey only — a correct password is refused. Your password is still stored, so you can turn this back on."
+                      : "Turning this off closes the password path entirely, so a phished or reused password cannot reach your account. Needs at least " +
+                        MIN_PASSWORDLESS_KEYS + " passkeys, so losing one device is not a lockout."}
+                  </p>
+                </div>
+                <button
+                  className={me.passkey_only ? "btn-ghost" : "btn-primary"}
+                  disabled={!me.passkey_only && (passkeys?.length ?? 0) < MIN_PASSWORDLESS_KEYS}
+                  title={
+                    !me.passkey_only && (passkeys?.length ?? 0) < MIN_PASSWORDLESS_KEYS
+                      ? `Register ${MIN_PASSWORDLESS_KEYS} passkeys first`
+                      : undefined
+                  }
+                  onClick={() => { setPwlDialog(true); setPwlError(""); }}
+                >
+                  {me.passkey_only ? "Turn password back on" : "Turn off password sign-in"}
+                </button>
+              </div>
+            </div>
           </>
+        )}
+      </Card>
+
+      <Card
+        title="Remembered devices"
+        action={
+          devices && devices.length > 0
+            ? <button className="btn-ghost !py-1.5 text-xs" onClick={forgetAllDevices}>
+                Forget all
+              </button>
+            : undefined
+        }
+      >
+        <p className="mb-3 text-sm text-slate-400">
+          When an account has no passkey and no authenticator app, a sign-in from an
+          unrecognised browser has to clear a code emailed to you. Browsers that have
+          cleared it are listed here and skip the step until they expire.
+        </p>
+        {(me.mfa_enabled || (passkeys?.length ?? 0) > 0) && (
+          <InfoText>
+            This account has a stronger second factor, so the emailed-code step does not
+            apply to it and no new devices will be recorded.
+          </InfoText>
+        )}
+        {!devices ? (
+          <Spinner />
+        ) : devices.length === 0 ? (
+          <Empty>No remembered devices.</Empty>
+        ) : (
+          <ul className="mt-3 divide-y divide-slate-800/60">
+            {devices.map((d) => (
+              <li key={d.id} className="flex items-center justify-between gap-3 py-2">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium text-slate-100">{d.label}</div>
+                  <div className="text-xs text-slate-500">
+                    {d.last_ip && `${d.last_ip} · `}
+                    last seen {d.last_seen_at ? dateTime(d.last_seen_at) : "never"} ·
+                    expires {shortDate(d.expires_at)}
+                  </div>
+                </div>
+                <button className="shrink-0 text-xs text-red-400 hover:text-red-300"
+                        onClick={() => forgetDevice(d.id)}>
+                  Forget
+                </button>
+              </li>
+            ))}
+          </ul>
         )}
       </Card>
 
@@ -492,6 +641,8 @@ export default function SettingsPage() {
         )}
         {!setup && !me.mfa_enabled && <ErrorText>{mfaError}</ErrorText>}
       </Card>
+
+      <ApiKeysCard />
 
       {/* ------------------------------------------------ dialogs */}
 
@@ -625,6 +776,44 @@ export default function SettingsPage() {
           <ErrorText>{pkError}</ErrorText>
           <button type="submit" disabled={busy} className="btn-primary w-full">
             {busy ? "Follow your browser's prompt…" : "Create passkey"}
+          </button>
+        </form>
+      </Dialog>
+
+      <Dialog
+        open={pwlDialog}
+        title={me.passkey_only ? "Turn password sign-in back on" : "Turn off password sign-in"}
+        onClose={() => setPwlDialog(false)}
+      >
+        <form onSubmit={setPasswordless} className="space-y-4">
+          {me.passkey_only ? (
+            <InfoText>
+              Your password will work again at sign-in. Your passkeys stay registered.
+            </InfoText>
+          ) : (
+            <p className="text-sm text-slate-400">
+              After this, your password is refused at sign-in even when it is correct, and
+              this account is reachable only with one of your {passkeys?.length ?? 0}{" "}
+              passkeys. You can turn it back on here at any time while you are signed in.
+            </p>
+          )}
+          <div>
+            <label className="label" htmlFor="pwl-pw">Confirm your password</label>
+            <input id="pwl-pw" type="password" required autoComplete="current-password"
+                   className="input" value={pwlPassword}
+                   onChange={(e) => setPwlPassword(e.target.value)} />
+          </div>
+          {me.mfa_enabled && (
+            <div>
+              <label className="label" htmlFor="pwl-code">Authenticator code</label>
+              <input id="pwl-code" inputMode="numeric" maxLength={8} required className="input"
+                     value={pwlCode} onChange={(e) => setPwlCode(e.target.value)} />
+            </div>
+          )}
+          <ErrorText>{pwlError}</ErrorText>
+          <button type="submit" disabled={busy}
+                  className={me.passkey_only ? "btn-primary w-full" : "btn-danger w-full"}>
+            {busy ? "Saving…" : me.passkey_only ? "Turn password back on" : "Turn off password sign-in"}
           </button>
         </form>
       </Dialog>

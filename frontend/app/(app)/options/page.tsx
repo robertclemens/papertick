@@ -10,7 +10,8 @@ import {
   OptionPositionViewT,
 } from "@/lib/api";
 import { money, pct, shortDate } from "@/lib/format";
-import { Badge, Card, Dialog, Empty, ErrorText, InfoText, Spinner } from "@/components/ui";
+import { useMarketRefresh } from "@/lib/market-refresh";
+import { Badge, Card, Dialog, Empty, ErrorText, InfoText, MarketStatus, Spinner } from "@/components/ui";
 import SymbolSearch from "@/components/symbol-search";
 
 type Right = "CALL" | "PUT";
@@ -78,6 +79,17 @@ export default function OptionsPage() {
       setLoading(false);
     }
   }
+
+  /** The whole chain is priced off the live underlying — every premium, greek
+   *  and breakeven moves with spot — and open contracts are marked to market
+   *  from those same prices, so both re-price together on the market cadence.
+   *  Silent: no `setLoading`, so the table never blanks under the reader. */
+  const { status: market, lastRefresh, refreshing, refreshNow } = useMarketRefresh(() => {
+    if (loadedFor && expiry) {
+      api<ChainT>(`/options/chain/${loadedFor}?expiry=${expiry}`).then(setChain).catch(() => {});
+    }
+    api<OptionPositionViewT[]>("/options/positions").then(setPositions).catch(() => {});
+  });
 
   async function switchExpiry(exp: string) {
     setExpiry(exp);
@@ -169,15 +181,19 @@ export default function OptionsPage() {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight">Options</h1>
-        <p className="mt-1 text-sm text-slate-400">
-          Calls, puts, covered calls and cash-secured puts.{" "}
-          <button className="text-emerald-400 hover:text-emerald-300"
-                  onClick={() => setShowEducation((v) => !v)}>
-            {showEducation ? "Hide the basics" : "New to options? Read the basics"}
-          </button>
-        </p>
+      <header className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Options</h1>
+          <p className="mt-1 text-sm text-slate-400">
+            Calls, puts, covered calls and cash-secured puts.{" "}
+            <button className="text-emerald-400 hover:text-emerald-300"
+                    onClick={() => setShowEducation((v) => !v)}>
+              {showEducation ? "Hide the basics" : "New to options? Read the basics"}
+            </button>
+          </p>
+          <MarketStatus status={market} lastRefresh={lastRefresh}
+                        refreshing={refreshing} onRefresh={refreshNow} />
+        </div>
       </header>
 
       {showEducation && (

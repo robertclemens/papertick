@@ -1,18 +1,22 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from datetime import date
 from decimal import Decimal
 
+import logging
+
 from app.db import get_db
 from app.deps import Principal, owned_account, require_read
-from app.models import Account, Dividend, TaxLot
+from app.models import Account, AccountType, Dividend, TaxLot
 from app.rate_limit import rate_limiter
 from app.schemas import (
     AccountReturnsOut,
     DividendOut,
     LotOut,
+    MonthEventOut,
+    MonthlyPerformanceOut,
     PerformanceOut,
     PortfolioSummaryOut,
     PositionOut,
@@ -20,6 +24,8 @@ from app.schemas import (
 )
 from app.services import metrics
 from app.services.market_data import MarketDataError, market_data
+
+log = logging.getLogger("papertick.portfolio")
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
@@ -46,6 +52,26 @@ def portfolio_dividends(
     return [DividendOut.model_validate(d) for d in db.execute(q).scalars()]
 
 
+def _refresh_dividends(user_id: str) -> None:
+    """Ask a worker to bring this user's dividends up to date.
+
+    Off the request path on purpose: the first sweep of the day costs one
+    calendar lookup per security held, and nobody should wait on that to see
+    their dashboard. It is also throttled to once per account per day, so the
+    enqueue is a no-op on every load after the first.
+
+    Best-effort by design — if the broker is unreachable the page still
+    renders. Nothing is lost, because reconciliation is a pure function of the
+    ledger and simply runs on the next read or before the next order.
+    """
+    try:
+        from app.workers.tasks import reconcile_user_dividends
+
+        reconcile_user_dividends.delay(user_id)
+    except Exception:                                    # noqa: BLE001
+        log.debug("could not enqueue dividend refresh", exc_info=True)
+
+
 @router.get("/summary", response_model=PortfolioSummaryOut)
 def portfolio_summary(account_id: str | None = None,
                       principal: Principal = Depends(require_read),
@@ -53,7 +79,11 @@ def portfolio_summary(account_id: str | None = None,
     """Balances and gains across the active scenario (or one account): cost
     basis, unrealized gains, realized gains split into taxable and
     tax-sheltered portions, total dividends and fees, and cash reserved or
-    committed to open orders."""
+    committed to open orders.
+
+    Reading this is what makes a user's dividends current: the first call of
+    the day schedules a reconciliation in the background."""
+    _refresh_dividends(principal.user.id)
     return metrics.summary(db, principal.user, account_id, principal.scenario_id)
 
 
@@ -144,3 +174,48 @@ def portfolio_performance(
     the requested range. Rate of return is Modified Dietz under a year and
     annualized IRR (XIRR) beyond a year; TWR is reported alongside either way."""
     return metrics.performance(db, principal.user, account_id, range, principal.scenario_id)
+
+
+@router.get("/performance/monthly", response_model=MonthlyPerformanceOut,
+            dependencies=[Depends(rate_limiter("performance", 30, 60))])
+def portfolio_performance_monthly(
+    account_id: str | None = None,
+    account_type: AccountType | None = None,
+    months: int | None = Query(default=12, ge=1, le=600),
+    principal: Principal = Depends(require_read),
+    db: Session = Depends(get_db),
+) -> MonthlyPerformanceOut:
+    """Month-by-month performance for the active scenario, newest first.
+
+    Each row splits the change in value into what was put in (`net_cash_flow`),
+    what the market did (`market_gain`), and what was paid out (`income`), so
+
+        ending_balance = beginning_balance + net_cash_flow + market_gain + income
+
+    `cumulative_return` runs from inception regardless of how many months are
+    requested — asking to see fewer months does not change how much of the
+    balance the market provided. Scope with `account_id` for a single account or
+    `account_type` for every account of one kind; omit both to aggregate.
+
+    `months` caps how many rows come back (default 12); pass a larger number or
+    omit it for the full history."""
+    return metrics.monthly_performance(db, principal.user, account_id, months,
+                                       principal.scenario_id, account_type)
+
+
+@router.get("/performance/monthly/{month}/events", response_model=list[MonthEventOut],
+            dependencies=[Depends(rate_limiter("performance", 30, 60))])
+def portfolio_month_events(
+    month: str = Path(pattern=r"^\d{4}-\d{2}$", description="YYYY-MM"),
+    account_id: str | None = None,
+    account_type: AccountType | None = None,
+    principal: Principal = Depends(require_read),
+    db: Session = Depends(get_db),
+) -> list[MonthEventOut]:
+    """Everything that happened inside one month — deposits, withdrawals, fills
+    and dividends — in date order, scoped the same way as the monthly table.
+
+    This is what sits behind a row: the daily *shape* of a month is already the
+    performance chart, so what is useful here is which events produced it."""
+    return metrics.month_events(db, principal.user, month, account_id,
+                                principal.scenario_id, account_type)

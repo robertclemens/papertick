@@ -5,6 +5,7 @@ SELECT ... FOR UPDATE SKIP LOCKED so concurrent workers never double-execute.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -23,10 +24,11 @@ from app.models import (
     RuleStatus,
     utcnow,
 )
+from app.config import get_settings
 from app.services import market_calendar as cal
 from app.services.market_data import MarketDataError, market_data
-from app.services.scheduling import advance_rule
-from app.services.trading import _slipped, execute_fill
+from app.services.scheduling import advance_rule, occurrences
+from app.services.trading import _close_or_none, _slipped, execute_fill
 from app.workers.celery_app import celery
 
 log = logging.getLogger("papertick.worker")
@@ -49,6 +51,66 @@ def _contribution_room(db, account_id: str) -> Decimal:
     return Decimal(current[0].remaining)
 
 
+
+def _aware(value: datetime | None) -> datetime | None:
+    """Timestamps come back from Postgres tz-aware, but not from every backend
+    (SQLite has no tz type), and a naive one here would raise mid-comparison
+    and take the whole recurring run down with it. Stored times are UTC."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
+def _due_runs(rule: RecurringRule, now: datetime) -> list[datetime]:
+    """Every run this rule owes, oldest first.
+
+    Normally one element: the run that just came due. After an outage — or any
+    stretch where the worker was not running — it is every occurrence that was
+    missed, so a three-day gap on a daily rule replays three buys instead of
+    collapsing them into one. Occurrences older than MAX_CATCHUP_DAYS are
+    dropped rather than replayed, so restoring an old backup cannot fire years
+    of trades at once.
+    """
+    first = _aware(rule.next_run_at)
+    if first is None or first > now:
+        return []
+    settings = get_settings()
+    if not settings.catchup_missed_runs:
+        return [first]
+    times = [first] + occurrences(
+        rule.cadence, rule.day_of_week, rule.day_of_month, rule.month_of_year,
+        after=first, until=now,
+    )
+    floor = now - timedelta(days=settings.max_catchup_days)
+    fresh = [t for t in times if t >= floor]
+    if len(fresh) < len(times):
+        log.warning(
+            "rule %s: skipping %d run(s) older than the %d-day catch-up window",
+            rule.id, len(times) - len(fresh), settings.max_catchup_days,
+        )
+    return fresh
+
+
+def _replay_price(db, rule: RecurringRule, order: Order, when: datetime,
+                  now: datetime) -> Decimal | None:
+    """Fill price for a run that should have happened at `when`.
+
+    A missed run is priced at the close actually printed on its own day, not
+    at today's price: the whole point of catching up is that the ledger ends up
+    where it would have been had the system never stopped. Only a run that is
+    due right now takes the live quote.
+    """
+    if when.date() >= now.date():
+        asset = db.get(Asset, rule.ticker)
+        if asset is not None and asset.asset_class == AssetClass.MUTUAL_FUND:
+            return None                      # caller routes funds to NAV pricing
+        quote = market_data.quote(rule.ticker)
+        return _slipped(quote.price, OrderSide.BUY, order.id)
+    # Backfill: the printed close for that day. Funds and equities alike settle
+    # on the published number, so no slippage is invented on top of it.
+    return _close_or_none(rule.ticker, when.date())
+
+
 @celery.task
 def run_recurring_investments() -> int:
     from app.services.scenarios import frozen_accounts
@@ -67,53 +129,106 @@ def run_recurring_investments() -> int:
                 skip_locked=True,
             )
         ).scalars().all()
+        if rules:
+            from app.services.convention import ensure_fresh_for_write
+
+            ensure_fresh_for_write()
+            # Same reason as scheduled orders: a recurring buy draws on
+            # settlement cash, so any dividend owed to it must be credited
+            # before buying power is computed.
+            from app.services.dividends import ensure_current
+
+            ensure_current(db, [r.account_id for r in rules])
         for rule in rules:
-            amount = Decimal(rule.amount)
-            if rule.fund_to_limit:
-                # "fund to my limit": never contribute past the room left when
-                # the run actually fires, so the final run of the year lands
-                # exactly on the limit even if money went in elsewhere
-                amount = min(amount, _contribution_room(db, rule.account_id))
-                if amount <= 0:
-                    log.info("rule %s skipped: %s contribution room is used up",
-                             rule.id, rule.ticker)
-                    rule.last_run_at = now
-                    rule.next_run_at = advance_rule(rule, now)
-                    processed += 1
-                    continue
-            order = Order(
-                account_id=rule.account_id,
-                ticker=rule.ticker,
-                side=OrderSide.BUY,
-                order_type=OrderType.MARKET,
-                quantity_type=QuantityType.DOLLARS,
-                quantity=amount,
-                source=OrderSource.RECURRING,
-                recurring_rule_id=rule.id,
-            )
-            db.add(order)
-            db.flush()
-            asset = db.get(Asset, rule.ticker)
-            if asset is not None and asset.asset_class == AssetClass.MUTUAL_FUND:
-                # fund buys are forward-priced at that day's closing NAV
-                order.nav_date = cal.nav_date_for(now)
-                order.scheduled_for = cal.mf_fill_time(order.nav_date)
-                order.status = OrderStatus.SCHEDULED
-                txn = order  # not a failure
-            else:
-                try:
-                    quote = market_data.quote(rule.ticker)
-                    txn = execute_fill(db, order, _slipped(quote.price, OrderSide.BUY), now.date())
-                except MarketDataError as exc:
-                    order.status = OrderStatus.REJECTED
-                    order.reject_reason = f"Market data unavailable: {exc}"
-                    txn = None
-            if txn is None:
-                rule.failure_count += 1
-                log.warning("recurring rule %s failed: %s", rule.id, order.reject_reason)
-            rule.last_run_at = now
-            rule.next_run_at = advance_rule(rule, now)
-            processed += 1
+            runs = _due_runs(rule, now)
+            if not runs:
+                continue
+            stalled_at = None
+            for when in runs:
+                # A run the outage swallowed is rebuilt at its own date: the
+                # order is stamped as placed then, priced at that day's close,
+                # and the transaction timestamped to the moment it was due.
+                backfill = when.date() < now.date()
+                amount = Decimal(rule.amount)
+                if rule.fund_to_limit:
+                    # "fund to my limit": never contribute past the room left
+                    # when the run actually fires, so the final run of the year
+                    # lands exactly on the limit even if money went in elsewhere
+                    amount = min(amount, _contribution_room(db, rule.account_id))
+                    if amount <= 0:
+                        log.info("rule %s skipped: %s contribution room is used up",
+                                 rule.id, rule.ticker)
+                        rule.last_run_at = when
+                        processed += 1
+                        continue
+                order = Order(
+                    account_id=rule.account_id,
+                    ticker=rule.ticker,
+                    side=OrderSide.BUY,
+                    order_type=OrderType.MARKET,
+                    quantity_type=QuantityType.DOLLARS,
+                    quantity=amount,
+                    source=OrderSource.RECURRING,
+                    recurring_rule_id=rule.id,
+                )
+                db.add(order)
+                db.flush()
+                if backfill:
+                    order.created_at = when
+                    order.as_of = when.date()
+
+                asset = db.get(Asset, rule.ticker)
+                is_mf = asset is not None and asset.asset_class == AssetClass.MUTUAL_FUND
+                filled = None
+                if is_mf and not backfill:
+                    # a fund buy due today is forward-priced at tonight's NAV
+                    order.nav_date = cal.nav_date_for(now)
+                    order.scheduled_for = cal.mf_fill_time(order.nav_date)
+                    order.status = OrderStatus.SCHEDULED
+                    filled = order  # not a failure: it fills after the close
+                else:
+                    try:
+                        price = _replay_price(db, rule, order, when, now)
+                    except MarketDataError as exc:
+                        # Every real provider is unreachable. There is no
+                        # synthetic substitute by design, so this run is not
+                        # failed — it is left where it is and retried, and the
+                        # rule stops here so later runs are not skipped past.
+                        db.delete(order)
+                        stalled_at = when
+                        log.warning("recurring rule %s held at %s: market data "
+                                    "unavailable (%s)", rule.id, when.isoformat(), exc)
+                        break
+                    if price is None:
+                        order.status = OrderStatus.REJECTED
+                        order.reject_reason = (
+                            f"No published close for {rule.ticker} on {when.date()}"
+                        )
+                    else:
+                        filled = execute_fill(db, order, price, when.date())
+                        if filled is not None and backfill:
+                            filled.executed_at = when
+
+                if filled is None:
+                    rule.failure_count += 1
+                    log.warning("recurring rule %s failed for %s: %s",
+                                rule.id, when.isoformat(), order.reject_reason)
+                rule.last_run_at = when
+                processed += 1
+
+            if stalled_at is not None:
+                # Retry exactly this run next tick. Runs already completed above
+                # are behind it, so none of them replay.
+                rule.next_run_at = stalled_at
+                continue
+
+            # Otherwise move forward, even when a run was skipped or rejected:
+            # a next_run_at left in the past would replay the same failure on
+            # every tick.
+            nxt = advance_rule(rule, runs[-1])
+            while nxt <= now:
+                nxt = advance_rule(rule, nxt)
+            rule.next_run_at = nxt
         db.commit()
     except Exception:
         db.rollback()
@@ -201,6 +316,52 @@ def purge_expired_scenarios() -> int:
         if purged:
             log.info("purged %d expired scenario(s)", purged)
         return purged
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@celery.task
+def verify_price_conventions() -> list[str]:
+    """Measure every real provider's price convention against fixed fixtures.
+
+    This is a scheduled upstream call that is not driven by a due order or a
+    user — the one other place that is true. It earns it: two requests per
+    provider per month buys proof that the prices being written into the
+    ledger are on the basis this engine assumes. A vendor silently switching
+    to a total-return series is otherwise invisible, and the damage is
+    permanent (measured at 2.3x on a VWELX backtest).
+    """
+    from app.services.convention import probe_all
+    from app.services.market_data import market_data
+
+    providers = [p for p in market_data._chain() if p is not market_data.synthetic]
+    if not providers:
+        # everything is already quarantined; re-probe them so a fixed vendor
+        # can earn its way back in
+        providers = [market_data.yahoo]
+    return [f"{v.provider}={v.status}" for v in probe_all(providers)]
+
+
+@celery.task
+def reconcile_user_dividends(user_id: str) -> str:
+    """Bring one user's dividends up to date, off the request path.
+
+    Enqueued when somebody actually opens their portfolio, so the numbers they
+    are about to read are current. Throttled to once per account per day inside
+    `ensure_current`, so a busy session costs one sweep, not one per page load.
+    """
+    from app.models import Account
+    from app.services.dividends import ensure_current
+
+    db = get_sessionmaker()()
+    try:
+        ids = [a.id for a in db.query(Account).filter(Account.user_id == user_id)]
+        net = ensure_current(db, ids)
+        db.commit()
+        return str(net)
     except Exception:
         db.rollback()
         raise

@@ -9,15 +9,27 @@ from app.rate_limit import rate_limiter
 from app.models import User
 from app.schemas import (
     LoginOut,
+    PasswordlessIn,
     PasskeyLoginVerifyIn,
     PasskeyOut,
     PasskeyRegisterStartIn,
     PasskeyRegisterVerifyIn,
+    UserOut,
 )
 from app import security
 from app.services import passkeys
 
 router = APIRouter(prefix="/auth/passkeys", tags=["passkeys"])
+
+# Passwordless needs a spare: one authenticator with no password behind it is
+# a single point of failure for the whole account.
+MIN_PASSWORDLESS_KEYS = 2
+
+
+def _passkey_count(db: Session, user: User) -> int:
+    return db.query(WebAuthnCredential).filter(
+        WebAuthnCredential.user_id == user.id
+    ).count()
 
 
 def _require_step_up(user: User, password: str, code: str | None) -> None:
@@ -74,12 +86,46 @@ def list_passkeys(principal: Principal = Depends(require_manage),
 def delete_passkey(passkey_id: str, principal: Principal = Depends(require_manage),
                    db: Session = Depends(get_db)) -> None:
     """Deletes a passkey. Returns 404 for an id that doesn't exist or belongs
-    to another user, rather than distinguishing the two."""
+    to another user, rather than distinguishing the two.
+
+    Refused when it would leave a passwordless account with a single passkey:
+    that account has no password path to fall back on, so dropping to one
+    authenticator would make a lost device a permanent lockout."""
     row = db.get(WebAuthnCredential, passkey_id)
     if row is None or row.user_id != principal.user.id:
         raise HTTPException(status_code=404, detail="Passkey not found")
+    if principal.user.passkey_only and _passkey_count(db, principal.user) <= MIN_PASSWORDLESS_KEYS:
+        raise HTTPException(
+            status_code=422,
+            detail=("This account signs in with passkeys only, so it must keep at "
+                    f"least {MIN_PASSWORDLESS_KEYS} of them. Register another passkey "
+                    "first, or turn password sign-in back on."),
+        )
     db.delete(row)
     db.commit()
+
+
+@router.post("/passwordless", response_model=UserOut)
+def set_passwordless(data: PasswordlessIn, principal: Principal = Depends(require_manage),
+                     db: Session = Depends(get_db)) -> UserOut:
+    """Turn the password sign-in path off (or back on) for this account.
+
+    Enabling it requires at least two registered passkeys. One is a single
+    point of failure: with the password path closed behind it, losing that
+    authenticator locks the account out for good. The password hash is kept
+    either way, so the switch is reversible.
+    """
+    user = principal.user
+    _require_step_up(user, data.current_password, data.code)
+    if data.enabled and _passkey_count(db, user) < MIN_PASSWORDLESS_KEYS:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"Register at least {MIN_PASSWORDLESS_KEYS} passkeys before turning "
+                    "off password sign-in, so losing one device does not lock you out."),
+        )
+    user.passkey_only = data.enabled
+    db.commit()
+    return UserOut.model_validate(user)
 
 
 @router.post("/login/options", dependencies=[Depends(rate_limiter("pk-login", 30, 60))])
@@ -98,17 +144,19 @@ def login_options() -> dict:
 def login_verify(data: PasskeyLoginVerifyIn, response: Response,
                  db: Session = Depends(get_db)) -> LoginOut:
     """Completes passkey login: verifies the signed challenge against the
-    stored public key and, on success, issues session tokens directly. There
-    When the account also has TOTP enrolled, this returns an `mfa_token` for
-    `/auth/login/mfa` instead of session tokens — the same second step the
-    password path takes."""
+    stored public key and, on success, issues session tokens directly.
+
+    A passkey sign-in is complete on its own, even when the account also has
+    TOTP enrolled. Registration and authentication both set
+    `user_verification=REQUIRED` and the flag is *enforced* on the response, so
+    the ceremony proves possession of the authenticator **and** the biometric
+    or PIN that unlocked it — two factors, and AAL2 under NIST SP 800-63B. The
+    authenticator is also origin-bound, which makes it strictly stronger than
+    the TOTP code it would otherwise be chained to: a phishable second factor
+    adds no security behind an unphishable first one, and the extra prompt
+    pushes people back towards the password path this exists to replace.
+    """
     from app.routers.auth import _issue_tokens
 
     user = passkeys.verify_authentication(db, data.flow_id, data.credential)
-    if user.mfa_enabled:
-        # A passkey proves possession of a registered authenticator; it is not
-        # a substitute for a second factor the user deliberately turned on.
-        # Signing in straight past TOTP here would let anyone holding a
-        # registered passkey bypass the account's own MFA setting.
-        return LoginOut(mfa_required=True, mfa_token=security.make_mfa_token(user.id))
     return LoginOut(tokens=_issue_tokens(db, user, response))

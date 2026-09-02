@@ -345,3 +345,118 @@ def test_purge_all_route_is_not_swallowed_by_the_id_route(db, user, scenario):
     assert literal < parameterised
     assert paths.index("/scenarios/deleted") < parameterised
     assert paths.index("/scenarios/import") < paths.index("/scenarios/{scenario_id}")
+
+
+# ------------------------------------------------------------- full copy mode
+
+def _counts(db, scenario_id):
+    ids = [a.id for a in db.query(Account).filter(Account.scenario_id == scenario_id)]
+    return {
+        m.__name__: (db.query(m).filter(m.account_id.in_(ids)).count() if ids else 0)
+        for m in (Order, Transaction, TaxLot, Contribution)
+    }
+
+
+def test_full_copy_carries_the_history_a_position_copy_drops(db, user, taxable, scenario):
+    """The two copy modes are the answer to the "my returns are gone" report:
+    `position` starts a track flat on purpose, `full` duplicates the past."""
+    _buy(db, taxable, days_ago=400)
+    _buy(db, taxable, days_ago=200)
+    db.commit()
+    before = _counts(db, scenario.id)
+    assert before["Transaction"] == 2
+
+    full = scenarios.create(db, user, "Full", copy_from_id=scenario.id, copy_mode="full")
+    db.commit()
+    assert _counts(db, full.id) == before
+
+    flat = scenarios.create(db, user, "Flat", copy_from_id=scenario.id, copy_mode="position")
+    db.commit()
+    # one synthetic opening buy per holding, not the two real ones
+    assert _counts(db, flat.id)["Transaction"] == 1
+
+
+def test_full_copy_rewrites_every_id(db, user, taxable, scenario):
+    """A copy must not share rows with, or point back into, its source."""
+    _buy(db, taxable)
+    db.commit()
+
+    full = scenarios.create(db, user, "Clone", copy_from_id=scenario.id, copy_mode="full")
+    db.commit()
+
+    src = {a.id for a in db.query(Account).filter(Account.scenario_id == scenario.id)}
+    dst = {a.id for a in db.query(Account).filter(Account.scenario_id == full.id)}
+    assert src and dst and not (src & dst)
+
+    dst_orders = {o.id for o in db.query(Order).filter(Order.account_id.in_(dst))}
+    txns = db.query(Transaction).filter(Transaction.account_id.in_(dst)).all()
+    assert txns and all(t.order_id in dst_orders for t in txns)
+
+
+def test_full_copy_reproduces_the_source_returns(db, user, taxable, scenario):
+    """The point of the mode: the duplicate performs identically."""
+    _buy(db, taxable, days_ago=300)
+    db.commit()
+
+    full = scenarios.create(db, user, "Same", copy_from_id=scenario.id, copy_mode="full")
+    db.commit()
+
+    base = metrics.summary(db, user, None, scenario.id)
+    clone = metrics.summary(db, user, None, full.id)
+    assert clone.invested_value == base.invested_value
+    assert clone.cost_basis == base.cost_basis
+    assert clone.cash == base.cash
+
+
+def test_backdated_setting_and_marking_travel_with_the_scenario(db, user, scenario, taxable):
+    """The per-scenario gate, the stored flag, and the export round trip.
+
+    A track that was allowed to backtest has to come back as one, and the fills
+    it produced have to stay marked — otherwise a restored export quietly
+    presents hindsight returns as ordinary ones.
+    """
+    from app.schemas import OrderCreateIn
+    from app.services import scenarios as svc
+    from app.services import trading
+
+    scenario.allow_backdated = True
+    db.commit()
+
+    _, txn = trading.place_order(
+        db, taxable,
+        OrderCreateIn(account_id=taxable.id, ticker="VOO", side="BUY",
+                      order_type="MARKET", quantity_type="DOLLARS",
+                      quantity=Decimal("1000"), as_of=date.today() - timedelta(days=45)),
+        OrderSource.API,
+    )
+    db.commit()
+    assert txn is not None and txn.backdated is True
+
+    payload = svc.export_scenario(db, user, scenario)
+    assert payload["scenario"]["allow_backdated"] is True
+
+    restored = svc.import_scenario(db, user, payload, name="Restored")
+    db.commit()
+    assert restored.allow_backdated is True
+
+    ids = [a.id for a in db.query(Account).filter_by(scenario_id=restored.id).all()]
+    marked = db.query(Transaction).filter(
+        Transaction.account_id.in_(ids), Transaction.backdated.is_(True)
+    ).count()
+    assert marked == 1, "the restored track must still say its fill was past-dated"
+
+
+def test_a_position_copy_does_not_inherit_the_backdating_setting(db, user, scenario):
+    """A position copy starts flat, so it starts as a clean record; a full copy
+    duplicates the track, the setting included."""
+    from app.services import scenarios as svc
+
+    scenario.allow_backdated = True
+    db.commit()
+
+    flat = svc.create(db, user, "Flat", copy_from_id=scenario.id, copy_mode="position")
+    full = svc.create(db, user, "Full", copy_from_id=scenario.id, copy_mode="full")
+    db.commit()
+
+    assert flat.allow_backdated is False
+    assert full.allow_backdated is True

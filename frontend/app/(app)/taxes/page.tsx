@@ -109,6 +109,14 @@ export default function TaxesPage() {
                  "would be ordinary income, plus a 10% penalty before age 59½")}
             {row("Roth IRA withdrawals", report.roth_withdrawals,
                  "qualified withdrawals are tax-free; early earnings may be taxed")}
+            {row("Roth conversions", report.conversions,
+                 "no annual limit and no income cap — uses none of your contribution room")}
+            {row("…taxable portion", report.conversion_taxable,
+                 "ordinary income this year, prorated against your after-tax basis")}
+            {row("10% early-distribution penalty", report.early_withdrawal_penalty,
+                 "on the taxable part of distributions before 59½, where no exception was claimed")}
+            {row("After-tax basis remaining", report.after_tax_basis,
+                 "Form 8606: comes out prorated across every Traditional and Rollover IRA")}
           </Card>
 
           <div className="space-y-2">

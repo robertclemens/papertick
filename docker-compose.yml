@@ -16,15 +16,46 @@ x-backend-env: &backend-env
   # so a client cannot choose its own rate-limit bucket.
   TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
   MARKET_DATA_PROVIDER: ${MARKET_DATA_PROVIDER:-auto}
+  # Keyless backstop for a Yahoo outage. Equities and ETFs only — its
+  # mutual-fund series is not split-adjusted, so funds are never asked of it.
+  NASDAQ_FALLBACK: ${NASDAQ_FALLBACK:-true}
   POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+  # Tiingo: the only configured vendor that carries mutual-fund NAVs.
+  TIINGO_API_TOKEN: ${TIINGO_API_TOKEN:-}
   ALPACA_API_KEY_ID: ${ALPACA_API_KEY_ID:-}
   ALPACA_API_SECRET: ${ALPACA_API_SECRET:-}
+  # Provider cache lifetimes and the shared outbound request budget. All three
+  # processes below count against one bucket, so the ceiling is per deployment.
+  QUOTE_CACHE_SECONDS: ${QUOTE_CACHE_SECONDS:-30}
+  HISTORY_CACHE_SECONDS: ${HISTORY_CACHE_SECONDS:-3600}
+  DIVIDEND_CACHE_SECONDS: ${DIVIDEND_CACHE_SECONDS:-90000}
+  MARKET_UPSTREAM_PER_MINUTE: ${MARKET_UPSTREAM_PER_MINUTE:-120}
+  MARKET_REFRESH_SECONDS: ${MARKET_REFRESH_SECONDS:-60}
+  # Mutual-fund NAVs publish after the close, not at it; these bound the wait.
+  # Prices must be split-adjusted, never dividend-adjusted; this measures
+  # each provider against fixed historical fixtures monthly.
+  CONVENTION_PROBE: ${CONVENTION_PROBE:-true}
+  CONVENTION_MAX_AGE_HOURS: ${CONVENTION_MAX_AGE_HOURS:-24}
+  CONVENTION_QUARANTINE: ${CONVENTION_QUARANTINE:-true}
+  NAV_POLL_INTERVAL_SECONDS: ${NAV_POLL_INTERVAL_SECONDS:-300}
+  NAV_POLL_GIVE_UP_HOURS: ${NAV_POLL_GIVE_UP_HOURS:-30}
+  # Hold a stuck fund order this long if an independent source confirms the
+  # NAV exists — the failure is ours, not the fund's. 0 restores a plain reject.
+  NAV_HOLD_MAX_DAYS: ${NAV_HOLD_MAX_DAYS:-5}
+  # Providers all unreachable: hold a due order this long before rejecting it.
+  # A synthetic price is never substituted.
+  MARKET_DATA_GIVE_UP_HOURS: ${MARKET_DATA_GIVE_UP_HOURS:-24}
+  # Replay recurring buys the worker slept through, at their own day's price.
+  CATCHUP_MISSED_RUNS: ${CATCHUP_MISSED_RUNS:-true}
+  MAX_CATCHUP_DAYS: ${MAX_CATCHUP_DAYS:-30}
   ENFORCE_MARKET_HOURS: ${ENFORCE_MARKET_HOURS:-true}
-  ALLOW_BACKDATED_TRADES: ${ALLOW_BACKDATED_TRADES:-false}
   SETTLEMENT_YIELD_ANNUAL: ${SETTLEMENT_YIELD_ANNUAL:-0}
   SCENARIO_RETENTION_DAYS: ${SCENARIO_RETENTION_DAYS:-30}
   TRADE_FEE_USD: ${TRADE_FEE_USD:-0.00}
+  SLIPPAGE_MODEL: ${SLIPPAGE_MODEL:-variable}
   SLIPPAGE_BPS: ${SLIPPAGE_BPS:-2}
+  SLIPPAGE_BPS_MIN: ${SLIPPAGE_BPS_MIN:--1}
+  SLIPPAGE_BPS_MAX: ${SLIPPAGE_BPS_MAX:-6}
   OPTION_FEE_PER_CONTRACT: ${OPTION_FEE_PER_CONTRACT:-0.65}
   RISK_FREE_RATE: ${RISK_FREE_RATE:-0.045}
   ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-900}
@@ -41,6 +72,11 @@ x-backend-env: &backend-env
   EMAIL_TOKEN_TTL_SECONDS: ${EMAIL_TOKEN_TTL_SECONDS:-86400}
   WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-}
   WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME:-PaperTick}
+  # New-device email OTP, for accounts with neither a passkey nor TOTP.
+  # Production only, whatever this says.
+  DEVICE_VERIFICATION: ${DEVICE_VERIFICATION:-true}
+  DEVICE_TRUST_DAYS: ${DEVICE_TRUST_DAYS:-30}
+  DEVICE_OTP_TTL_SECONDS: ${DEVICE_OTP_TTL_SECONDS:-600}
   DEMO_MODE: ${DEMO_MODE:-false}
   DEMO_EMAIL: ${DEMO_EMAIL:-}
   DEMO_PASSWORD: ${DEMO_PASSWORD:-}

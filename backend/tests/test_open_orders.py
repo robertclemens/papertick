@@ -114,7 +114,6 @@ def test_limit_order_defaults_to_gtc_60(db, taxable, enforce_hours):
 
 def test_expired_order_releases_committed_cash(db, taxable, enforce_hours):
     taxable.settlement_balance = Decimal("5000")
-    taxable.allow_external_funding = False
     db.commit()
     price = trading.market_data.quote("VOO").price
     order, _ = trading.place_order(
@@ -180,7 +179,6 @@ def test_summary_reports_committed_and_available(db, user, taxable, enforce_hour
     from app.services import metrics
 
     taxable.settlement_balance = Decimal("10000")
-    taxable.allow_external_funding = False
     db.commit()
     trading.place_order(db, taxable, _order(taxable.id, quantity=Decimal("4000")),
                         OrderSource.API, now=datetime(2026, 8, 29, 15, 0, tzinfo=timezone.utc))
@@ -197,7 +195,6 @@ def test_withdrawal_blocked_by_committed_cash(db, user, taxable, enforce_hours):
     from app.schemas import WithdrawIn
 
     taxable.settlement_balance = Decimal("5000")
-    taxable.allow_external_funding = False
     db.commit()
     trading.place_order(db, taxable, _order(taxable.id, quantity=Decimal("4000")),
                         OrderSource.API, now=datetime(2026, 8, 29, 15, 0, tzinfo=timezone.utc))

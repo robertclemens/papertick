@@ -141,3 +141,42 @@ def nav_date_for(now: datetime) -> date:
 
 def mf_fill_time(nav_date: date) -> datetime:
     return market_close_at(nav_date) + MF_FILL_DELAY
+
+
+# How long after the close fund NAVs keep landing. Equities stop moving at the
+# bell, but a mutual fund's price for the day is not published until hours
+# later, so a portfolio holding funds is genuinely still changing after 4 PM.
+NAV_SETTLING = timedelta(hours=4)
+
+
+def refresh_cadence(now: datetime, base_seconds: int,
+                    enforce_hours: bool = True) -> tuple[int, str]:
+    """How often the UI should re-price right now, and why.
+
+    The policy lives here rather than in the browser because this is where the
+    calendar is. There are three regimes:
+
+      open   — prices are moving; re-price at the configured cadence.
+      nav    — the session is over but fund NAVs are still posting, so the
+               value of a portfolio can still change. Poll, but slowly.
+      closed — nothing can change until the next open. Do not poll at all:
+               a request whose answer is knowably identical to the last one is
+               exactly the request not worth making, and the market is shut for
+               81% of the week.
+
+    Returns (seconds, reason); 0 seconds means "do not poll".
+    """
+    if base_seconds <= 0:
+        return 0, "off"
+    if not enforce_hours:
+        # sandbox mode fills at the latest price around the clock, so the
+        # displayed price is always live
+        return base_seconds, "open"
+    if is_market_open(now):
+        return base_seconds, "open"
+    d = now.astimezone(ET).date()
+    if is_trading_day(d):
+        close = market_close_at(d)
+        if close <= now < close + NAV_SETTLING:
+            return base_seconds * 10, "nav"
+    return 0, "closed"

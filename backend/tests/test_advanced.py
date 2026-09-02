@@ -350,13 +350,11 @@ def test_backdated_trade_restates_affected_statements(db, user, taxable):
     assert all(after[k] == before[k] for k in untouched)
 
 
-def test_backdated_trades_are_off_by_default(db, taxable, monkeypatch):
+def test_backdated_trades_are_off_unless_the_scenario_allows_them(db, taxable, scenario):
     from fastapi import HTTPException
 
-    from app.config import get_settings
-
-    locked = get_settings().model_copy(update={"allow_backdated_trades": False})
-    monkeypatch.setattr("app.services.trading.get_settings", lambda: locked)
+    scenario.allow_backdated = False
+    db.commit()
 
     with pytest.raises(HTTPException) as exc:
         trading.place_order(
@@ -364,11 +362,22 @@ def test_backdated_trades_are_off_by_default(db, taxable, monkeypatch):
             OrderSource.API,
         )
     assert exc.value.status_code == 422
-    assert "ALLOW_BACKDATED_TRADES" in exc.value.detail
+    assert "scenario" in exc.value.detail.lower()
 
     # same ticket without a past date still goes through
     order, txn = trading.place_order(db, taxable, _buy(taxable.id), OrderSource.API)
     assert txn is not None
+    assert txn.backdated is False
+
+    # and with the scenario opted in, the past-dated ticket fills and is marked
+    scenario.allow_backdated = True
+    db.commit()
+    _, back = trading.place_order(
+        db, taxable, _buy(taxable.id, as_of=date.today() - timedelta(days=30)),
+        OrderSource.API,
+    )
+    assert back is not None
+    assert back.backdated is True
 
 def test_activity_feed_sorts_by_effective_date(db, user, taxable):
     """A past-dated fill is entered today but belongs at its own date in an

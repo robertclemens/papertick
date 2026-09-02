@@ -38,6 +38,7 @@ export default function ScenariosPage() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [copyFrom, setCopyFrom] = useState("");
+  const [copyMode, setCopyMode] = useState<"position" | "full">("position");
 
   const [renaming, setRenaming] = useState<ScenarioT | null>(null);
   const [draftName, setDraftName] = useState("");
@@ -61,12 +62,18 @@ export default function ScenariosPage() {
     try {
       const created = await api<ScenarioT>("/scenarios", {
         method: "POST",
-        body: { name, description: description || null, copy_from_id: copyFrom || null },
+        body: {
+          name,
+          description: description || null,
+          copy_from_id: copyFrom || null,
+          copy_mode: copyMode,
+        },
       });
       setCreateOpen(false);
       setName("");
       setDescription("");
       setCopyFrom("");
+      setCopyMode("position");
       setNotice(`Created “${created.name}”.`);
       refresh();
     } catch (err) {
@@ -89,6 +96,13 @@ export default function ScenariosPage() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function setBackdating(s: ScenarioT, allow: boolean) {
+    setError("");
+    await api(`/scenarios/${s.id}`, { method: "PATCH", body: { allow_backdated: allow } })
+      .catch(() => setError("Could not change the past-dated trade setting"));
+    refresh();
   }
 
   async function makeDefault(s: ScenarioT) {
@@ -252,6 +266,12 @@ export default function ScenariosPage() {
                           default
                         </span>
                       )}
+                      {s.backdated_fills > 0 && (
+                        <span className="rounded-full border border-amber-900 bg-amber-950/40 px-2 py-0.5 text-[10px] text-amber-300"
+                              title="Contains trades entered after the date they filled on — placed with the outcome already known">
+                          {s.backdated_fills} past-dated fill{s.backdated_fills === 1 ? "" : "s"}
+                        </span>
+                      )}
                     </div>
                     {s.description && (
                       <p className="mt-1 text-sm text-slate-400">{s.description}</p>
@@ -261,6 +281,19 @@ export default function ScenariosPage() {
                       {shortDate(s.created_at)}
                       {s.copied_from_id && " · copied from another scenario"}
                     </p>
+                    <label className="mt-2 flex items-start gap-2 text-xs text-slate-400">
+                      <input type="checkbox" className="mt-0.5 accent-emerald-500"
+                             checked={s.allow_backdated}
+                             onChange={(e) => setBackdating(s, e.target.checked)} />
+                      <span>
+                        Allow past-dated trades
+                        <span className="block text-slate-500">
+                          Lets an order be placed for a date that has already happened — with
+                          the outcome known. Every such fill is marked wherever its numbers
+                          appear, including on statements.
+                        </span>
+                      </span>
+                    </label>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     {!isActive && (
@@ -431,12 +464,38 @@ export default function ScenariosPage() {
                 <option key={s.id} value={s.id}>Copy of {s.name}</option>
               ))}
             </select>
-            <p className="mt-1 text-xs text-slate-500">
-              A copy brings the accounts, cash and holdings across, priced at today&apos;s
-              market. Trades, dividends and auto-invest rules are left behind, so the new
-              scenario measures what happens from here rather than inheriting the past.
-            </p>
           </div>
+          {copyFrom && (
+            <fieldset className="rounded-lg border border-slate-800 p-3">
+              <legend className="px-1 text-xs font-medium text-slate-300">How much to copy</legend>
+              <label className="flex cursor-pointer gap-3 py-1.5">
+                <input type="radio" name="copy-mode" className="mt-1" value="position"
+                       checked={copyMode === "position"}
+                       onChange={() => setCopyMode("position")} />
+                <span className="text-sm">
+                  <span className="font-medium text-slate-200">Position only</span>
+                  <span className="mt-0.5 block text-xs text-slate-500">
+                    Accounts, cash and holdings, re-priced at today&apos;s market. Trades,
+                    dividends and auto-invest rules are left behind, so returns start at
+                    zero and measure what happens from here.
+                  </span>
+                </span>
+              </label>
+              <label className="flex cursor-pointer gap-3 py-1.5">
+                <input type="radio" name="copy-mode" className="mt-1" value="full"
+                       checked={copyMode === "full"}
+                       onChange={() => setCopyMode("full")} />
+                <span className="text-sm">
+                  <span className="font-medium text-slate-200">Everything, including history</span>
+                  <span className="mt-0.5 block text-xs text-slate-500">
+                    An exact duplicate — every order, transaction, tax lot, dividend and
+                    contribution. Returns and the full history carry over, so the copy
+                    performs identically until you change something.
+                  </span>
+                </span>
+              </label>
+            </fieldset>
+          )}
           <ErrorText>{error}</ErrorText>
           <button type="submit" disabled={busy} className="btn-primary w-full">
             {busy ? "Creating…" : "Create scenario"}

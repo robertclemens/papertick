@@ -17,11 +17,13 @@ import {
   SummaryT,
   TransactionT,
 } from "@/lib/api";
-import { dateTime, expenseRatioPct, money, pct, shares, shortDate, signedMoney } from "@/lib/format";
+import { dateTime, expenseRatioPct, money, monthLabel, pct, shares, shortDate, signedMoney } from "@/lib/format";
 import { AllocationDonut, AllocationGroupBy, PortfolioChart } from "@/components/charts";
-import { Badge, Card, Empty, Spinner, Stat } from "@/components/ui";
+import { MonthPerformanceT } from "@/lib/api";
+import { BackdatedNote, Badge, Card, Empty, MarketStatus, Spinner, Stat } from "@/components/ui";
 import { aggregateByTicker } from "@/lib/positions";
 import { useRangePref } from "@/lib/prefs";
+import { useMarketRefresh } from "@/lib/market-refresh";
 
 function gainClass(v: string | number | null | undefined): string {
   const n = typeof v === "string" ? parseFloat(v) : (v ?? 0);
@@ -44,6 +46,7 @@ export default function DashboardPage() {
   const [returns, setReturns] = useState<AccountReturnsT | null>(null);
   const [alloc, setAlloc] = useState<AllocationGroupBy>("holding");
   const [allAccounts, setAllAccounts] = useState<AccountT[]>([]);
+  const [thisMonth, setThisMonth] = useState<MonthPerformanceT | null>(null);
   const [accountFilter, setAccountFilter] = useState("");
 
   const scope = accountFilter ? `account_id=${accountFilter}` : "";
@@ -52,6 +55,23 @@ export default function DashboardPage() {
   useEffect(() => {
     api<AccountT[]>("/accounts").then(setAllAccounts).catch(() => {});
   }, []);
+
+  // the month in progress, for the strip that links through to /performance
+  useEffect(() => {
+    setThisMonth(null);
+    api<{ months: MonthPerformanceT[] }>(`/portfolio/performance/monthly?months=1&${scope}`)
+      .then((r) => setThisMonth(r.months[0] ?? null))
+      .catch(() => setThisMonth(null));
+  }, [scope]);
+
+  /** Re-price the value-bearing panels without blanking them first, so an
+   *  auto-refresh never flashes a spinner over numbers the user is reading. */
+  function repriceQuietly() {
+    api<SummaryT>(`/portfolio/summary?${scope}`).then(setSummary).catch(() => {});
+    api<PositionT[]>(`/portfolio/positions?${scope}`).then(setPositions).catch(() => {});
+  }
+  const { status: marketStatus, lastRefresh, refreshing, refreshNow } =
+    useMarketRefresh(repriceQuietly);
 
   useEffect(() => {
     setSummary(null);
@@ -101,6 +121,11 @@ export default function DashboardPage() {
         <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
           <p className="mt-1 text-sm text-slate-400">Your simulated wealth at a glance.</p>
+          <div className="flex flex-wrap items-center gap-2">
+            <MarketStatus status={marketStatus} lastRefresh={lastRefresh}
+                          refreshing={refreshing} onRefresh={refreshNow} />
+            <span className="mt-2"><BackdatedNote count={summary?.backdated_fills} /></span>
+          </div>
         </div>
         <div className="flex min-w-0 max-w-full items-center gap-2">
           {/* fixed width: a select sized w-auto grows to its longest option and
@@ -163,6 +188,79 @@ export default function DashboardPage() {
               deltaGood={null}
             />
           </div>
+
+          {thisMonth && (
+            <Link
+              href="/performance"
+              className="block rounded-xl border border-slate-800 bg-slate-900/40 px-5 py-3 transition hover:border-slate-700 hover:bg-slate-900/70"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                    This month so far
+                  </span>
+                  <span className="text-sm text-slate-400">{monthLabel(thisMonth.month)}</span>
+                  {thisMonth.backdated_fills > 0 && (
+                    <span
+                      className="text-amber-400"
+                      title={`${thisMonth.backdated_fills} past-dated fill(s) effective this month`}
+                    >
+                      ◷
+                    </span>
+                  )}
+                </div>
+                <span className="text-sm font-medium text-emerald-400">Month by month →</span>
+              </div>
+              {/* the same seven figures, in the same order, as this month's row
+                  in the month-by-month table on /performance */}
+              <dl className="mt-2.5 grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-4 lg:grid-cols-7">
+                <div>
+                  <dt className="text-xs text-slate-400">Beginning</dt>
+                  <dd className="mt-0.5 font-semibold tabular-nums text-slate-200">
+                    {money(thisMonth.beginning_balance)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-slate-400">Deposits &amp; withdrawals</dt>
+                  <dd className="mt-0.5 font-semibold tabular-nums text-slate-200">
+                    {parseFloat(thisMonth.net_cash_flow) === 0
+                      ? money(0)
+                      : signedMoney(thisMonth.net_cash_flow)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-slate-400">Market gain/loss</dt>
+                  <dd className={`mt-0.5 font-semibold tabular-nums ${gainClass(thisMonth.market_gain)}`}>
+                    {signedMoney(thisMonth.market_gain)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-slate-400">Income</dt>
+                  <dd className="mt-0.5 font-semibold tabular-nums text-slate-200">
+                    {money(thisMonth.income)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-slate-400">Your return</dt>
+                  <dd className={`mt-0.5 font-semibold tabular-nums ${gainClass(thisMonth.personal_return)}`}>
+                    {signedMoney(thisMonth.personal_return)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-slate-400">Cumulative</dt>
+                  <dd className={`mt-0.5 font-semibold tabular-nums ${gainClass(thisMonth.cumulative_return)}`}>
+                    {signedMoney(thisMonth.cumulative_return)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-xs text-slate-400">Ending balance</dt>
+                  <dd className="mt-0.5 font-semibold tabular-nums text-slate-100">
+                    {money(thisMonth.ending_balance)}
+                  </dd>
+                </div>
+              </dl>
+            </Link>
+          )}
 
           <div className="grid gap-4 lg:grid-cols-3">
             <Card

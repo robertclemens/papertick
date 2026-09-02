@@ -9,6 +9,17 @@ celery.conf.update(
     task_ignore_result=True,
     timezone="UTC",
     broker_connection_retry_on_startup=True,
+    # Note: there is deliberately no price-convention entry here either.
+    # Verification is gated on freshness at the moment of a fill
+    # (services/convention.ensure_fresh), so it runs when something is about
+    # to be written and never on an idle deployment.
+    #
+    # Note: there is deliberately no dividend-reconciliation entry here.
+    # Reconciliation is a pure function of the ledger and the ex-date calendar,
+    # so it yields the same result whenever it runs. It is therefore triggered
+    # by the two things that actually depend on it — an order about to execute,
+    # and a user about to read their portfolio — rather than on a clock. See
+    # app/services/dividends.ensure_current.
     beat_schedule={
         "run-recurring-investments": {
             "task": "app.workers.tasks.run_recurring_investments",
@@ -35,10 +46,6 @@ celery.conf.update(
         "purge-expired-scenarios": {
             "task": "app.workers.tasks.purge_expired_scenarios",
             "schedule": crontab(hour=4, minute=30),
-        },
-        "reconcile-dividends": {
-            "task": "app.workers.tasks.reconcile_dividends",
-            "schedule": 6 * 3600.0,
         },
         "process-option-expirations": {
             "task": "app.workers.tasks.process_option_expirations",

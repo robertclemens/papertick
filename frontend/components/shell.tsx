@@ -13,10 +13,10 @@ const NAV = [
   { href: "/trade", label: "Trade", icon: "⇄" },
   { href: "/options", label: "Options", icon: "⌥" },
   { href: "/schedules", label: "Auto-Invest", icon: "↻" },
+  { href: "/performance", label: "Performance", icon: "◪" },
   { href: "/history", label: "History", icon: "≡" },
   { href: "/statements", label: "Statements", icon: "▦" },
   { href: "/taxes", label: "Taxes", icon: "％" },
-  { href: "/keys", label: "API Keys", icon: "⚿" },
   { href: "/scenarios", label: "Scenarios", icon: "◆" },
   { href: "/settings", label: "Settings", icon: "⚙" },
 ];

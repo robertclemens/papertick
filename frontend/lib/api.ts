@@ -65,7 +65,7 @@ export async function api<T = any>(
     if (await tryRefresh()) {
       return api<T>(path, { method, body, retry: false });
     }
-    if (typeof window !== "undefined") window.location.href = withBasePath("/login");
+    if (typeof window !== "undefined") window.location.href = withBasePath("/login?expired=1");
     throw new ApiError(401, "Session expired");
   }
   if (res.status === 204) return undefined as T;
@@ -99,7 +99,7 @@ export async function download(path: string, fallbackName: string): Promise<void
   let res = await fetch(withBasePath(`/api/v1${path}`), init);
   if (res.status === 401) {
     if (!(await tryRefresh())) {
-      if (typeof window !== "undefined") window.location.href = withBasePath("/login");
+      if (typeof window !== "undefined") window.location.href = withBasePath("/login?expired=1");
       throw new ApiError(401, "Session expired");
     }
     res = await fetch(withBasePath(`/api/v1${path}`), init);

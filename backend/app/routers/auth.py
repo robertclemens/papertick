@@ -93,9 +93,24 @@ def _set_cookies(response: Response, access: str, refresh: str) -> None:
 
 
 def _clear_cookies(response: Response) -> None:
+    """Expire both session cookies.
+
+    The attributes have to mirror `_set_cookies`. Starlette's `delete_cookie`
+    defaults `secure` and `httponly` to False, and a `__Host-`/`__Secure-`
+    cookie is only accepted *with* Secure — so a delete that omits it is
+    rejected by the browser outright and the cookie survives a sign-out, still
+    presented on every later request while the session behind it is revoked.
+    """
+    s = get_settings()
     access_path, refresh_path = _cookie_paths()
-    response.delete_cookie(ACCESS_COOKIE, path=access_path)
-    response.delete_cookie(REFRESH_COOKIE, path=refresh_path)
+    response.delete_cookie(
+        ACCESS_COOKIE, path=access_path,
+        httponly=True, samesite="lax", secure=s.cookie_secure,
+    )
+    response.delete_cookie(
+        REFRESH_COOKIE, path=refresh_path,
+        httponly=True, samesite="lax", secure=s.cookie_secure,
+    )
 
 
 def _issue_tokens(db: Session, user: User, response: Response) -> TokenPair:

@@ -133,7 +133,14 @@ def remember(db: Session, user: User, request: Request, response: Response) -> N
 
 
 def forget_cookie(response: Response) -> None:
-    response.delete_cookie(DEVICE_COOKIE, path=cookie_path())
+    # Mirror the attributes `remember` sets, for the same reason `_clear_cookies`
+    # does: a delete whose attributes disagree with the original is not
+    # guaranteed to land. This cookie carries no `__Host-`/`__Secure-` prefix,
+    # so today's asymmetry still expires it — keep them in step anyway.
+    response.delete_cookie(
+        DEVICE_COOKIE, path=cookie_path(),
+        httponly=True, samesite="lax", secure=get_settings().cookie_secure,
+    )
 
 
 def list_for(db: Session, user: User) -> list[TrustedDevice]:

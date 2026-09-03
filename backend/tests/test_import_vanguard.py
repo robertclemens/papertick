@@ -107,3 +107,61 @@ def test_shares_and_price_come_from_the_dollars_that_moved(db, brokerage, tmp_pa
     import_account(db, brokerage.user_id, brokerage, rows, dry_run=True)
     position = db.query(Position).filter_by(account_id=brokerage.id, ticker="VOO").one()
     assert Decimal(position.shares) == Decimal("0.804200")
+
+
+# ---------------------------------------------------------- tax-year designation
+
+@pytest.fixture()
+def roth_account(db, user, scenario):
+    if db.get(Asset, "VOO") is None:
+        db.add(Asset(ticker="VOO", name="VOO", asset_class=AssetClass.ETF,
+                     expense_ratio=Decimal("0.0003")))
+    a = Account(user_id=user.id, scenario_id=scenario.id, account_type=AccountType.ROTH_IRA,
+                name="Roth", settlement_balance=Decimal("0"))
+    db.add(a)
+    db.commit()
+    return a
+
+
+# A payroll contribution made on the last business day of the year settles in
+# the first days of the next one. Both dates are in the export; only one of
+# them designates the tax year.
+YEAR_BOUNDARY = [
+    ("1/2/2025",  "12/30/2024", "", "To: BANK", "Contribution", "CASH", "", "", "", "$125.0000"),
+    ("1/8/2025",  "1/8/2025",   "", "To: BANK", "Contribution", "CASH", "", "", "", "$100.0000"),
+]
+
+
+def test_tax_year_comes_from_the_trade_date_not_settlement(db, user, roth_account, tmp_path, limits):
+    """The bug that shifted a year of contributions one bucket forward.
+
+    Booking the 30 December contribution as tax year 2025 because the cash
+    landed on 2 January is what made every year carry one payment too many, and
+    the last year on record tip over the annual limit.
+    """
+    rows, _ = read_rows(build(tmp_path, YEAR_BOUNDARY))
+    import_account(db, user, roth_account, rows, dry_run=True)
+
+    by_year = {c.tax_year: Decimal(c.amount)
+               for c in db.query(Contribution).filter_by(account_id=roth_account.id).all()}
+    assert by_year == {2024: Decimal("125.00"), 2025: Decimal("100.00")}
+
+
+def test_a_rollover_row_is_not_a_contribution(db, user, roth_account, tmp_path, limits):
+    """The export names the movement; a rollover consumes no annual room."""
+    from app.models import CashFlowKind
+    from app.services import irs
+
+    rows, _ = read_rows(build(tmp_path, [
+        ("1/8/2025", "1/8/2025", "", "From: 401k", "Rollover",     "CASH", "", "", "", "$40000.0000"),
+        ("1/9/2025", "1/9/2025", "", "To: BANK",   "Contribution", "CASH", "", "", "", "$500.0000"),
+    ]))
+    import_account(db, user, roth_account, rows, dry_run=True)
+
+    rolled = db.query(Contribution).filter_by(
+        account_id=roth_account.id, kind=CashFlowKind.ROLLOVER).one()
+    assert Decimal(rolled.amount) == Decimal("40000.00")
+    assert rolled.tax_year is None
+    # ...and it left the year's contribution room untouched
+    assert irs.contributed_for_year(
+        db, user, 2025, roth_account.scenario_id) == Decimal("500.00")

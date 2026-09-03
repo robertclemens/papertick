@@ -370,8 +370,8 @@ def import_account(db, user: User, account: Account, rows: list[Row],
         repay()
         if row.kind == "cash_in":
             memo = MANUAL_MEMO if row.raw_type == "--fund" else IMPORT_MEMO
-            _deposit(db, user, account, row.settles, row.amount, is_ira, memo,
-                     row.raw_type, stats)
+            _deposit(db, user, account, row.settles, row.day, row.amount, is_ira,
+                     memo, row.raw_type, stats)
             stats["deposits"] += 1
             continue
 
@@ -432,7 +432,7 @@ def import_account(db, user: User, account: Account, rows: list[Row],
         last = rows[-1].settles if rows else date.today()
         inferred.append((last, "", credit))
         stats["inferred_deposits"] += 1
-        _deposit(db, user, account, last, credit, is_ira, FUNDING_MEMO, "", stats)
+        _deposit(db, user, account, last, last, credit, is_ira, FUNDING_MEMO, "", stats)
         repay()
 
     db.flush()
@@ -461,9 +461,21 @@ def _annual_limit(db, user: User, tax_year: int) -> Decimal | None:
     return limit
 
 
-def _deposit(db, user: User, account: Account, day: date, amount: Decimal,
-             is_ira: bool, memo: str, raw_type: str, stats) -> None:
+def _deposit(db, user: User, account: Account, day: date, traded: date,
+             amount: Decimal, is_ira: bool, memo: str, raw_type: str, stats) -> None:
     """Book one cash-in, classified the way the export classifies it.
+
+    Two dates, because the export has two and they mean different things.
+    `day` is the settlement date — when the cash actually moved, so it stamps
+    the ledger row and drives the replay's running balance. `traded` is the
+    trade date — when the contribution was *made*, which is what designates its
+    tax year.
+
+    Using the settlement date for both is what silently shifted a year's worth
+    of contributions. A payroll contribution made in the last days of December
+    settles in the first days of January, so it was designated to the wrong
+    tax year — and because that repeats every year, each year carried one extra
+    payment and the last one on record tipped over the annual limit.
 
     Two things were wrong here, and both inflated "IRA contributions".
 
@@ -484,6 +496,7 @@ def _deposit(db, user: User, account: Account, day: date, amount: Decimal,
     """
     amount = q_money(amount)
     stamp = datetime.combine(day, time(12, 0), tzinfo=timezone.utc)
+    tax_year = traded.year
 
     def _add(kind: CashFlowKind, value: Decimal, tax_year: int | None, note: str) -> None:
         if value <= 0:
@@ -500,9 +513,9 @@ def _deposit(db, user: User, account: Account, day: date, amount: Decimal,
     else:
         from app.services import irs
 
-        limit = _annual_limit(db, user, day.year)
+        limit = _annual_limit(db, user, tax_year)
         if limit is None:
-            _add(CashFlowKind.CONTRIBUTION, amount, day.year, memo)
+            _add(CashFlowKind.CONTRIBUTION, amount, tax_year, memo)
         else:
             used = Decimal(db.execute(
                 select(func.coalesce(func.sum(Contribution.amount), 0))
@@ -510,16 +523,21 @@ def _deposit(db, user: User, account: Account, day: date, amount: Decimal,
                 .where(Account.user_id == user.id,
                        Account.scenario_id == account.scenario_id,
                        Account.account_type.in_(irs.IRA_LIKE),
-                       Contribution.tax_year == day.year,
+                       Contribution.tax_year == tax_year,
                        Contribution.kind == CashFlowKind.CONTRIBUTION)
             ).scalar_one())
             room = max(ZERO, limit - used)
             fits = min(amount, room)
             excess = amount - fits
-            _add(CashFlowKind.CONTRIBUTION, fits, day.year, memo)
+            _add(CashFlowKind.CONTRIBUTION, fits, tax_year, memo)
             if excess > 0:
+                # The export does not carry the tax-year designation itself, so
+                # a contribution made between Jan 1 and Tax Day could legally
+                # belong to either year and this cannot tell which. Rather than
+                # guess, the excess is carried as a transfer in and counted; the
+                # tax summary flags the year so it can be corrected by hand.
                 _add(CashFlowKind.ROLLOVER, excess, None,
-                     f"{memo} — over the {day.year} limit, carried as a transfer in")
+                     f"{memo} — over the {tax_year} limit, carried as a transfer in")
                 stats["over_limit_reclassified"] += 1
     account.settlement_balance = Decimal(account.settlement_balance) + amount
 

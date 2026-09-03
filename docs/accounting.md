@@ -83,6 +83,22 @@ Two gates keep the distinction from eroding:
   scenario copy and nothing else; accepting one would let external money into an
   IRA outside the annual limit just by naming a different kind.
 
+**A contribution's tax year comes from the trade date.** The Vanguard export
+carries both a trade date and a settlement date, and they mean different
+things: the settlement date is when the cash moved, so it drives the replay's
+running balance, but the trade date is when the contribution was *made*, which
+is what designates its tax year. A payroll contribution made on the last
+business day of December settles in the first days of January — designating it
+by settlement puts it in the wrong year, and because that repeats annually,
+every year carries one payment too many until the most recent one tips over the
+limit.
+
+The export does **not** carry the tax-year designation itself, so a
+contribution made between Jan 1 and Tax Day could legally belong to either
+year and the importer cannot tell which. It does not guess: it designates by
+trade date, and where that would exceed the year's limit the excess is carried
+as a transfer in and counted, for the summary below to surface.
+
 **Over-limit years are called out.** The contribution meters only cover years
 still open for designation, so a closed year with too much in it has nothing
 watching it. The tax summary says so instead. It is worded as a classification

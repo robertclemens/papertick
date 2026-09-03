@@ -62,11 +62,17 @@ tax summary. Getting it wrong does not lose money — it misreports it.
 | `WITHDRAWAL` | — | Withdrawals |
 | `CONVERSION` | no | Roth conversions |
 
-`OPENING_BALANCE` is the value an account was carried in with when a scenario
-was copied: its cash plus the market value of its holdings, so the new track's
-performance starts at zero instead of inheriting gains earned elsewhere. It is
-not a contribution — the money was already inside the wrapper — and it is not a
-rollover, which is a specific reportable event. It used to be written as a
+`OPENING_BALANCE` is money that was already inside the wrapper before the
+record begins. A scenario copy produces it: each account is carried in with its
+cash plus the market value of its holdings, so the new track's performance
+starts at zero instead of inheriting gains earned elsewhere. So does an import,
+when the file shows money being spent that it never shows arriving — an
+exchange whose buy leg exceeds its sell leg was paid for out of settlement cash
+from before the export's window, and that difference is not a deposit. It is
+not a contribution — the money was already inside the wrapper, and inventing a
+tax-year designation for money whose origin is unknown is exactly what pushes a
+year over its limit — and it is not a rollover, which is a specific reportable
+event. It used to be written as a
 rollover, which added the whole value of every copied account to "rollovers
 received", and put a rollover on taxable brokerage accounts, which cannot
 receive one at all. Existing rows are reclassified on startup.

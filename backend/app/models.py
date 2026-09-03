@@ -67,16 +67,24 @@ class CashFlowKind(str, enum.Enum):
     # has no annual limit and no income cap — treating it as a contribution
     # would have it consume IRA room it does not consume.
     CONVERSION = "CONVERSION"
-    # The value an account was *opened* with when a scenario was copied or a
-    # statement history imported: cash plus the market value of the holdings
-    # carried across. Deliberately its own kind rather than a rollover, which
+    # Money that was already inside the wrapper before the record begins.
+    #
+    # Two things produce it. A scenario copy opens each account with its cash
+    # plus the market value of the holdings carried across. An import books it
+    # when the file shows money being spent that the file never shows arriving
+    # — an exchange whose buy leg exceeds its sell leg, say, paid for out of
+    # settlement cash from before the export's window.
+    #
+    # Deliberately its own kind rather than a rollover, which
     # is what it used to be written as. A rollover is a specific, reportable
     # event — money leaving a retirement plan and landing in an IRA — and
     # counting an opening balance as one overstates "rollovers received" by the
     # whole value of the copied account. It is also not a contribution: it
     # consumes no annual room, because the money was already inside the
-    # wrapper before the copy. It is external money in, and it is reported as
-    # exactly that and nothing else.
+    # wrapper already. It is reported as exactly that and nothing else — in
+    # particular it consumes no annual contribution room, because inventing a
+    # tax-year designation for money whose origin is unknown is what silently
+    # pushes a year over its limit.
     OPENING_BALANCE = "OPENING_BALANCE"
 
 

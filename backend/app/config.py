@@ -49,6 +49,18 @@ class Settings(BaseSettings):
     alpaca_api_key_id: str = ""
     alpaca_api_secret: str = ""
 
+    # --- IRS contribution-limit refresh -------------------------------------
+    # Reads the published IRA limits back from irs.gov and reconciles them
+    # against the seeded table, so a year carried forward as a projection is
+    # replaced by official figures once the IRS publishes them (usually in the
+    # October/November COLA release). Turn it off for an air-gapped or offline
+    # deployment: the app still works, it just keeps its projections until
+    # someone updates the seed table by hand.
+    irs_limit_refresh: bool = True
+    # Restricts the source chain to the named sources, in order
+    # ("cola", "pub590a"). Empty uses the full chain.
+    irs_limit_sources: str = ""
+
     # --- Price-convention verification --------------------------------------
     # Historical prices must be split-adjusted and NOT dividend-adjusted, or
     # dividends are counted twice (see services/convention.py). A vendor can

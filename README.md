@@ -25,7 +25,10 @@ have.
 
 - **Four account buckets** — taxable brokerage, Roth, Traditional and Rollover IRA, with
   annual contribution limits, age-50 catch-up, prior-year designation and rollover
-  exemptions enforced as you deposit.
+  exemptions enforced as you deposit. Limits are seeded from Publication 590-A back to
+  1997 — including the years before catch-up contributions existed — so an imported
+  statement is checked against the limit that actually applied that year. Each autumn a
+  job reconciles them against irs.gov, and stops once the new figures are recorded.
 - **Real market emulation** — NYSE calendar and hours, orders queued outside them,
   mutual funds forward-priced at the daily NAV, limit orders with expiry, simulated
   commission and a slippage distribution rather than a flat fudge factor.

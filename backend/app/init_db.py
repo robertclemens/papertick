@@ -85,7 +85,31 @@ ASSET_UNIVERSE = [
 # Emancipation Day shifts included, and the two COVID extensions (tax year 2019
 # ran to 15 July 2020, and 2020 to 17 May 2021) are real designation windows
 # that a contribution could legitimately have used.
+#
+# The table starts at 1997, the first year of the modern IRA regime (TRA '97
+# raised the deductibility phase-outs and created the Roth, effective 1998).
+# Two discontinuities in here are real and must not be smoothed over:
+#   - Catch-up contributions did not exist before 2002. EGTRRA created them,
+#     so 1997-2001 carry a catch-up of exactly $0 rather than inheriting the
+#     $1,000 that a naive carry-forward would give them — a 55-year-old who
+#     put $2,500 into an IRA for 1999 was over the limit, and the app has to
+#     be able to say so.
+#   - The catch-up was $500 for 2002-2005 and only stepped to $1,000 in 2006.
 IRS_LIMITS = [
+    (1997, "2000", "0", date(1998, 4, 15)),
+    (1998, "2000", "0", date(1999, 4, 15)),
+    (1999, "2000", "0", date(2000, 4, 17)),
+    (2000, "2000", "0", date(2001, 4, 16)),
+    (2001, "2000", "0", date(2002, 4, 15)),
+    (2002, "3000", "500", date(2003, 4, 15)),
+    (2003, "3000", "500", date(2004, 4, 15)),
+    (2004, "3000", "500", date(2005, 4, 15)),
+    (2005, "4000", "500", date(2006, 4, 17)),
+    (2006, "4000", "1000", date(2007, 4, 17)),
+    (2007, "4000", "1000", date(2008, 4, 15)),
+    (2008, "5000", "1000", date(2009, 4, 15)),
+    (2009, "5000", "1000", date(2010, 4, 15)),
+    (2010, "5000", "1000", date(2011, 4, 18)),
     (2011, "5000", "1000", date(2012, 4, 17)),
     (2012, "5000", "1000", date(2013, 4, 15)),
     (2013, "5500", "1000", date(2014, 4, 15)),

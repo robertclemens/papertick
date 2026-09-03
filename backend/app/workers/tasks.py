@@ -26,6 +26,7 @@ from app.models import (
 )
 from app.config import get_settings
 from app.services import market_calendar as cal
+from app.services.irs_source import IrsSourceError
 from app.services.market_data import MarketDataError, market_data
 from app.services.scheduling import advance_rule, occurrences
 from app.services.trading import _close_or_none, _slipped, execute_fill
@@ -441,6 +442,72 @@ def generate_statements() -> int:
             ).scalars():
                 created += generate_missing(db, user, scenario_id=scenario.id)
         return created
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@celery.task(
+    bind=True,
+    # Retries are deliberately slow. Nothing here is time-critical: the IRS
+    # publishes next year's figures once, in the autumn, and the app already
+    # holds a working projection in the meantime. Hammering irs.gov to learn a
+    # number that changes annually would be rude and pointless, so a failed run
+    # backs off in hours, not seconds, and gives up after ~2 days — the next
+    # Monday in the November-January window picks it up again regardless, and
+    # a limit published in November does not apply until January.
+    autoretry_for=(IrsSourceError, OSError),
+    retry_backoff=3600,        # 1h, 2h, 4h, 8h, 16h
+    retry_backoff_max=86400,
+    retry_jitter=True,
+    max_retries=5,
+)
+def refresh_irs_limits(self, force: bool = False) -> dict:
+    """Reconcile the stored contribution limits against published IRS figures.
+
+    Fetches from the source chain in `services/irs_source` (COLA table first,
+    Pub 590-A as backup) and applies the reconciliation policy: projections are
+    replaced, official rows are only ever confirmed, and a disagreement is
+    recorded as a MISMATCH for a person to resolve.
+
+    Returns without touching the network once the upcoming tax year's figures
+    are official — the beat keeps ticking through the November-January window,
+    but there is nothing left for a fetch to settle, so it stops asking.
+    `force=True` reconciles anyway, for an on-demand run
+    (`refresh_irs_limits.delay(force=True)`).
+    """
+    from app.models import LimitCheckOutcome
+    from app.services.irs_source import reconcile_limits, refresh_needed
+
+    if not get_settings().irs_limit_refresh:
+        log.info("IRS limit refresh disabled (IRS_LIMIT_REFRESH=false)")
+        return {}
+
+    attempt = self.request.retries
+    if attempt:
+        log.info("IRS limit refresh: retry %d of %d", attempt, self.max_retries)
+
+    db = get_sessionmaker()()
+    try:
+        needed, reason = refresh_needed(db)
+        if not needed and not force:
+            log.info("IRS limit refresh: skipped, %s", reason)
+            return {}
+        log.info("IRS limit refresh: %s", "forced" if force and not needed else reason)
+        checks = reconcile_limits(db)
+        summary: dict[str, int] = {}
+        for c in checks:
+            summary[c.outcome.value] = summary.get(c.outcome.value, 0) + 1
+        mismatches = [c.tax_year for c in checks
+                      if c.outcome == LimitCheckOutcome.MISMATCH]
+        if mismatches:
+            log.error("IRS limit refresh found %d mismatch(es): tax year(s) %s",
+                      len(mismatches), mismatches)
+        else:
+            log.info("IRS limit refresh: %s", summary or "nothing to reconcile")
+        return summary
     except Exception:
         db.rollback()
         raise

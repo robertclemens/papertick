@@ -11,6 +11,7 @@ Rules implemented:
 Income-based phase-outs are intentionally out of scope for this simulator.
 """
 
+import logging
 from datetime import date, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 
@@ -29,6 +30,8 @@ from app.models import (
     User,
 )
 from app.schemas import IrsStatusOut
+
+log = logging.getLogger("papertick.irs")
 
 CENT = Decimal("0.01")
 
@@ -61,7 +64,11 @@ def allowed_tax_years(db: Session, today: date) -> list[int]:
 def user_limit(db: Session, user: User, tax_year: int) -> tuple[Decimal, bool]:
     row = get_limit_row(db, tax_year)
     age_at_year_end = tax_year - user.date_of_birth.year
-    catchup = age_at_year_end >= row.catchup_age
+    # Age alone is not enough: catch-up contributions did not exist before
+    # 2002, so those years carry an amount of $0. Reporting `catchup=True`
+    # there would tell a 1999 contributor their limit "includes the age-50+
+    # catch-up amount" when it adds nothing.
+    catchup = age_at_year_end >= row.catchup_age and Decimal(row.ira_catchup) > 0
     limit = Decimal(row.ira_limit) + (Decimal(row.ira_catchup) if catchup else Decimal("0"))
     return limit, catchup
 
@@ -310,10 +317,41 @@ def irs_status(db: Session, user: User, tax_year: int,
 
 # ---------------------------------------------------------------- auto-maintenance
 
+#: First filing season in which DC's Emancipation Day moved the federal
+#: deadline. The District made it a holiday in 2005, but 2007 was the first
+#: year it actually pushed Tax Day — April 2006's shift was the weekend alone.
+#: Applying the rule retroactively would date 2006 a day late.
+EMANCIPATION_FROM = 2007
+
+
+def _emancipation_day(year: int) -> date:
+    """DC Emancipation Day as *observed*: April 16, moved to the Friday before
+    when it falls on a Saturday and the Monday after when it falls on a
+    Sunday."""
+    d = date(year, 4, 16)
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
 def tax_day(year: int) -> date:
-    """Tax Day: April 15, rolled to Monday when it lands on a weekend."""
+    """Tax Day for a filing year: April 15, pushed past weekends and past DC's
+    Emancipation Day.
+
+    Emancipation Day is a District holiday, not a federal one, but the filing
+    deadline is set by where the IRS is headquartered, so it moves the national
+    date. This matters here beyond tidiness: the returned date is a
+    contribution's prior-year designation deadline, so a deadline computed a
+    day early rejects a contribution the IRS would have accepted.
+
+    One-off statutory postponements (the 2019 and 2020 COVID extensions) are
+    not derivable and live in the seed table instead.
+    """
+    holiday = _emancipation_day(year) if year >= EMANCIPATION_FROM else None
     d = date(year, 4, 15)
-    while d.weekday() >= 5:
+    while d.weekday() >= 5 or d == holiday:
         d += timedelta(days=1)
     return d
 
@@ -321,9 +359,9 @@ def tax_day(year: int) -> date:
 def ensure_limits(db: Session, today: date | None = None) -> list[int]:
     """Keep limits present for the current and next year. Missing years are
     carried forward from the latest known year as 'projected' (the IRS indexes
-    IRA limits to inflation in $500 steps; projections should be replaced by
-    the official figures via the seed table when published). Returns the years
-    created."""
+    IRA limits to inflation in $500 steps; projections are replaced by the
+    official figures either via the seed table or by the November-January
+    refresh in `services/irs_source`). Returns the years created."""
     today = today or date.today()
     created: list[int] = []
     for year in (today.year, today.year + 1):
@@ -345,6 +383,20 @@ def ensure_limits(db: Session, today: date | None = None) -> list[int]:
         created.append(year)
     if created:
         db.commit()
+
+    # The refresh that retires a projection only runs November-January, so a
+    # deployment that was down for that window (or first started after it) can
+    # reach January still enforcing a carried-forward guess. That is worth
+    # saying out loud every day it is true: it is the one case where the number
+    # being applied to real contributions was never published by anyone.
+    current = db.get(IrsLimit, today.year)
+    if current is not None and current.source == "projected":
+        log.warning(
+            "IRA limits for the current tax year (%d) are still a projection "
+            "($%s + $%s catch-up), not published figures. Run "
+            "refresh_irs_limits(force=True), or update the seed table.",
+            today.year, current.ira_limit, current.ira_catchup,
+        )
     return created
 
 

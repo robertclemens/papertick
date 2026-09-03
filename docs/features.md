@@ -53,8 +53,38 @@ below is what those lines actually mean.
   archived immutably and downloadable from the Statements page.
 - **IRS limit auto-maintenance** — a daily task carries the latest official
   contribution limits forward into new tax years as "projected" (flagged in the
-  API/UI) until official figures are seeded, so limits never go missing at
-  year-roll.
+  API/UI), so limits never go missing at year-roll. A second task then reads the
+  published figures back from irs.gov and retires that projection:
+  the COLA table first (`/retirement-plans/cola-increases-...`, a real table
+  carrying next year's numbers from the autumn release), falling back to
+  Publication 590-A (`/publications/p590a`, prose and authoritative, but it
+  lags a tax year). Every parsed figure is bounds-checked — plausible range,
+  the IRS $500 indexing step, catch-up not exceeding the limit — and anything
+  that fails is dropped rather than guessed at.
+
+  A year marked "projected" is replaced by the published figures. A year
+  already marked "official" is **never** overwritten: agreement just stamps
+  `verified_at`, and a disagreement is logged and written to `irs_limit_checks`
+  as a MISMATCH for a person to resolve. A parser that has drifted onto the
+  wrong cell must not silently mis-enforce a whole tax year.
+
+  **It does not poll.** The figure changes once a year, so the beat fires
+  weekly only from **November through January** — the window the COLA release
+  has landed in every recent year (21 Oct 2022 for tax year 2023; 1 Nov for
+  2024 and 2025; 13 Nov for 2026), plus a tail in case the IRS is late. Inside
+  that window it stops itself as soon as the upcoming year is official: a
+  settled year is never re-confirmed, and a deployment with nothing outstanding
+  makes no requests at all. Failures back off in hours (1h to a 24h cap, ~2
+  days total). Nothing is time-critical — a limit published in November does
+  not apply until January.
+
+  A deployment that is down for the whole window would carry its projection
+  into the year it applies. That is the one case where an enforced limit was
+  never published by anyone, so the daily maintenance task logs a warning every
+  day the *current* tax year is still a projection.
+  `refresh_irs_limits.delay(force=True)` reconciles on demand, and
+  `IRS_LIMIT_REFRESH=false` turns the outbound call off entirely for an
+  air-gapped deployment.
 - **Open symbol universe** — any US-listed USD equity/ETF/mutual fund validated by
   the live data source is auto-registered on first use; unknown symbols are
   rejected. A curated seed carries category/region/expense-ratio/prospectus data.
@@ -75,7 +105,16 @@ below is what those lines actually mean.
 - **IRS rule engine** — annual IRA limits shared across all IRAs (with age-50+ catch-up
   from your date of birth), prior-year designation between Jan 1 and Tax Day,
   rollovers exempt, over-limit deposits blocked with actionable errors.
-  Limits are data (`irs_limits` table), seeded for 2024–2026.
+  Limits are data (`irs_limits` table), seeded from Publication 590-A for every
+  tax year from 1997 on. The history is not decoration: an imported statement
+  carries contributions as far back as the export goes, and each is checked
+  against the limit that actually applied. Two discontinuities in that range
+  are modelled rather than smoothed — catch-up contributions did not exist
+  before 2002 (those years carry $0, so a 55-year-old's 1999 limit is $2,000,
+  not $3,000), and the catch-up was $500 for 2002–2005 before stepping to
+  $1,000 in 2006. Prior-year designation deadlines are the real Tax Day,
+  including weekend shifts, DC Emancipation Day from 2007 on, and the two COVID
+  postponements.
 - **Trading engine** — market & limit orders, buy/sell by dollars or shares
   (fractional to 6 dp), flat fee, average-cost basis, realized/unrealized gains.
   Slippage is drawn per fill from a configurable window rather than applied as a

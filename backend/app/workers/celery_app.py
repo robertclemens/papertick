@@ -63,6 +63,19 @@ celery.conf.update(
             "task": "app.workers.tasks.ensure_irs_limits",
             "schedule": crontab(hour=5, minute=0),
         },
+        # Weekly Mondays, but only November through January. This reads
+        # irs.gov, and the figure it wants is published once a year in the
+        # autumn COLA release, so running year-round would be ~50 requests to
+        # learn one fact. The window opens after the release has landed in
+        # every recent year and runs into January in case the IRS is late.
+        # The task also stops itself inside the window as soon as the upcoming
+        # year is official (see irs_source.refresh_needed), so a deployment
+        # with nothing outstanding makes no requests at all.
+        "refresh-irs-limits": {
+            "task": "app.workers.tasks.refresh_irs_limits",
+            "schedule": crontab(hour=5, minute=10, day_of_week=1,
+                                month_of_year="11,12,1"),
+        },
     },
 )
 

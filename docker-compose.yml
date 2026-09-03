@@ -32,6 +32,12 @@ x-backend-env: &backend-env
   TIINGO_API_TOKEN: ${TIINGO_API_TOKEN:-}
   ALPACA_API_KEY_ID: ${ALPACA_API_KEY_ID:-}
   ALPACA_API_SECRET: ${ALPACA_API_SECRET:-}
+  # Reconciles the seeded IRA contribution limits against irs.gov each autumn
+  # (weekly, November-January, stopping once the new figures land). Replaces a
+  # carried-forward projection; never overwrites a limit already marked
+  # official. false for air-gapped.
+  IRS_LIMIT_REFRESH: ${IRS_LIMIT_REFRESH:-true}
+  IRS_LIMIT_SOURCES: ${IRS_LIMIT_SOURCES:-}
   # Provider cache lifetimes and the shared outbound request budget. All three
   # processes below count against one bucket, so the ceiling is per deployment.
   QUOTE_CACHE_SECONDS: ${QUOTE_CACHE_SECONDS:-30}

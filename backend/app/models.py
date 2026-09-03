@@ -712,6 +712,45 @@ class IrsLimit(Base):
     # "official" = seeded from published IRS figures; "projected" = auto-carried
     # forward by the platform until official figures are entered.
     source: Mapped[str] = mapped_column(String(16), default="official")
+    # When this row was last checked against a published IRS source, and which
+    # one. Null means it has only ever been the seed table's word for it.
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None)
+    verified_from: Mapped[str | None] = mapped_column(String(200), default=None)
+
+
+class LimitCheckOutcome(str, enum.Enum):
+    """What one year's reconciliation against a published IRS source decided."""
+
+    CONFIRMED = "CONFIRMED"    # official row, source agrees
+    UPDATED = "UPDATED"        # projected row replaced by official figures
+    ADDED = "ADDED"            # year had no row at all; inserted from source
+    MISMATCH = "MISMATCH"      # official row disagrees with source — left alone
+    UNREADABLE = "UNREADABLE"  # no source could be read this run
+
+
+class IrsLimitCheck(Base):
+    """One year's result from one run of the limit refresh.
+
+    Kept as a trail rather than just a log line because MISMATCH is the row
+    that matters: it means either the parser latched onto the wrong figure or
+    a seeded limit is wrong, and both need a person to look. The refresh never
+    overwrites an "official" row on its own, so without this table a mismatch
+    would leave no durable evidence anywhere.
+    """
+
+    __tablename__ = "irs_limit_checks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    ran_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                             default=utcnow, index=True)
+    tax_year: Mapped[int] = mapped_column(Integer, index=True)
+    outcome: Mapped[LimitCheckOutcome] = mapped_column(SAEnum(LimitCheckOutcome))
+    source_name: Mapped[str | None] = mapped_column(String(32), default=None)
+    source_url: Mapped[str | None] = mapped_column(String(200), default=None)
+    found_limit: Mapped[object | None] = mapped_column(Numeric(18, 2), default=None)
+    found_catchup: Mapped[object | None] = mapped_column(Numeric(18, 2), default=None)
+    detail: Mapped[str | None] = mapped_column(String(300), default=None)
 
 
 class CostBasisOverride(Base):

@@ -77,7 +77,28 @@ ASSET_UNIVERSE = [
 ]
 
 # (tax_year, ira_limit, catch_up, designation deadline = next year's Tax Day)
+#
+# History matters as much as the current year: an imported statement carries
+# contributions going back as far as the export does, and without a limit for
+# those years the app cannot say whether any of them was over — it simply shows
+# nothing, which reads as "fine". Deadlines are the real Tax Day, weekend and
+# Emancipation Day shifts included, and the two COVID extensions (tax year 2019
+# ran to 15 July 2020, and 2020 to 17 May 2021) are real designation windows
+# that a contribution could legitimately have used.
 IRS_LIMITS = [
+    (2011, "5000", "1000", date(2012, 4, 17)),
+    (2012, "5000", "1000", date(2013, 4, 15)),
+    (2013, "5500", "1000", date(2014, 4, 15)),
+    (2014, "5500", "1000", date(2015, 4, 15)),
+    (2015, "5500", "1000", date(2016, 4, 18)),
+    (2016, "5500", "1000", date(2017, 4, 18)),
+    (2017, "5500", "1000", date(2018, 4, 17)),
+    (2018, "5500", "1000", date(2019, 4, 15)),
+    (2019, "6000", "1000", date(2020, 7, 15)),   # COVID extension
+    (2020, "6000", "1000", date(2021, 5, 17)),   # COVID extension
+    (2021, "6000", "1000", date(2022, 4, 18)),
+    (2022, "6000", "1000", date(2023, 4, 18)),
+    (2023, "6500", "1000", date(2024, 4, 15)),
     (2024, "7000", "1000", date(2025, 4, 15)),
     (2025, "7000", "1000", date(2026, 4, 15)),
     (2026, "7500", "1100", date(2027, 4, 15)),

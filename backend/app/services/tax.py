@@ -9,6 +9,8 @@ calendar year).
 
 from decimal import Decimal
 
+from fastapi import HTTPException
+
 from sqlalchemy import extract, func, select
 from sqlalchemy.orm import Session
 
@@ -25,7 +27,7 @@ from app.models import (
     User,
 )
 from app.schemas import TaxYearSummaryOut
-from app.services import ira
+from app.services import ira, irs
 
 ZERO = Decimal("0")
 CENT = Decimal("0.01")
@@ -191,6 +193,25 @@ def tax_report(db: Session, user: User, year: int, scenario_id: str | None,
             "IRAs (Form 8606). It comes out prorated against their combined value, never "
             "on its own."
         )
+    # An over-limit year is almost always a misclassified import rather than a
+    # real excess contribution — a custodian would have refused the deposit. It
+    # is stated here because nothing else looks at a closed year: the
+    # contribution meters only cover years still open for designation, so
+    # without this a mislabelled rollover sits in the record indefinitely.
+    if contributions > ZERO and ira_ids:
+        try:
+            limit, _ = irs.user_limit(db, user, year)
+        except HTTPException:
+            limit = None
+        if limit is not None and contributions > limit:
+            notes.append(
+                f"Contributions designated to {year} total ${contributions}, over the "
+                f"${limit} limit for that year. A custodian would have refused the "
+                "excess, so this is usually a rollover or a transfer in that was "
+                "imported as a contribution, or a deposit that belongs to the "
+                "neighbouring tax year."
+            )
+
     notes.append(
         "Not modelled: required minimum distributions, the individual exceptions to the "
         "10% early-distribution penalty, state income tax, and the net investment income tax."

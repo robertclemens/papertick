@@ -83,6 +83,15 @@ Two gates keep the distinction from eroding:
   scenario copy and nothing else; accepting one would let external money into an
   IRA outside the annual limit just by naming a different kind.
 
+**Over-limit years are called out.** The contribution meters only cover years
+still open for designation, so a closed year with too much in it has nothing
+watching it. The tax summary says so instead. It is worded as a classification
+question rather than an accusation, because that is almost always what it is: a
+custodian refuses a regular contribution above the limit, so an over-limit year
+in imported history is a rollover, a transfer in, or a deposit that belongs to
+the neighbouring tax year. Limits are seeded back to 2011 — a year with no
+limit on record cannot be checked at all, and silence reads as approval.
+
 **Scenarios are scoped, everywhere.** Each scenario is an independent track with
 its own contribution history, so the annual limit, the tax summary and the
 birthdate-impact check are all computed within one scenario. Summing across them

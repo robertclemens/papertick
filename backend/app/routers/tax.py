@@ -50,7 +50,7 @@ def tax_years(principal: Principal = Depends(require_read),
 
 @router.get("/report", response_model=TaxYearSummaryOut)
 def get_tax_report(
-    year: int | None = Query(default=None, ge=2015, le=2100),
+    year: int | None = Query(default=None, ge=2011, le=2100),
     account_id: str | None = None,
     principal: Principal = Depends(require_read),
     db: Session = Depends(get_db),
@@ -68,7 +68,7 @@ def get_tax_report(
 
 @router.get("/report.csv", response_class=PlainTextResponse)
 def get_tax_report_csv(
-    year: int | None = Query(default=None, ge=2015, le=2100),
+    year: int | None = Query(default=None, ge=2011, le=2100),
     account_id: str | None = None,
     principal: Principal = Depends(require_read),
     db: Session = Depends(get_db),

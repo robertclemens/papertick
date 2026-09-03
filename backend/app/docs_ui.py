@@ -9,6 +9,12 @@ the wrong shade of grey", never to a broken page.
 
 ReDoc has no dark mode of its own, so it is booted through `Redoc.init` with an
 explicit theme object built from the same palette.
+
+Where a foreground had to be forced, it is because the contrast was measured
+and failed, not because a shade looked off: Swagger's expand arrows ship a
+literal `fill="#000"` in the symbol markup (1.04:1 on slate), its prose is left
+at the light theme's `#3b4151` (1.98:1), and both libraries put white text on
+pale method badges (1.6-2.5:1). Each of those has a comment saying which.
 """
 
 from fastapi import FastAPI
@@ -29,6 +35,37 @@ MUTED = "#94a3b8"
 ACCENT = "#10b981"    # emerald-500
 CODE = "#fbbf24"
 TYPE = "#7dd3fc"
+
+# HTTP method colors, moved onto the app's own palette. Swagger's defaults are
+# pale pastels carrying white text — around 1.6:1, which is what makes the
+# method pills hard to read. These are the app's emerald / sky / amber / red,
+# and every one of them is light enough to carry **black** text at 6:1 or
+# better, so INK_ON_COLOR is used for anything sitting on a filled surface.
+INK_ON_COLOR = "#04140d"
+M_GET = "#38bdf8"     # sky-400
+M_POST = "#10b981"    # emerald-500
+M_PUT = "#f59e0b"     # amber-500
+M_PATCH = "#2dd4bf"    # teal-400
+M_DELETE = "#ef4444"  # red-500
+M_HEAD = "#c084fc"    # purple-400
+M_OPTIONS = "#94a3b8"  # slate-400
+
+# The same methods again, several steps darker, for ReDoc.
+#
+# Swagger's method pill is a class we can style, so there it gets the bright
+# color above and black text. ReDoc draws its verb badge with white text
+# hard-coded in a styled-component, and its class names are emotion hashes that
+# change between builds — so the only durable lever is the one color ReDoc does
+# expose. These are chosen to carry *white* at 5.5:1 or better rather than to
+# match Swagger's swatch exactly: a badge that is readable in both places beats
+# two badges that are the same shade and one of them unreadable.
+R_GET = "#0369a1"      # sky-700
+R_POST = "#047857"     # emerald-700
+R_PUT = "#b45309"      # amber-700
+R_PATCH = "#0f766e"    # teal-700
+R_DELETE = "#b91c1c"   # red-700
+R_HEAD = "#7e22ce"     # purple-700
+R_OPTIONS = "#475569"  # slate-600
 
 FONT = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
 MONO = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace'
@@ -131,6 +168,124 @@ html.dark-mode .swagger-ui .tab li.active button.tablinks {{ color: {ACCENT}; }}
 html.dark-mode .swagger-ui table thead tr td, html.dark-mode .swagger-ui table thead tr th {{
   border-color: {BORDER}; color: {MUTED};
 }}
+
+/* ---- readability ----------------------------------------------------------
+   Everything below fixes a measured contrast failure, not a preference.
+   Swagger's dark mode recolors its surfaces but leaves several foregrounds at
+   the light theme's values, so they end up near-black on near-black. */
+
+/* The expand/collapse chevrons. Swagger draws them as an <svg class="arrow">
+   pointing at a <symbol>, and the symbol carries `fill="#000"` in the markup —
+   a stylesheet that only sets colors on text never touches it, so every arrow
+   on the page was pure black on slate at 1.04:1, i.e. invisible. Fill has to
+   be forced on the <use> as well as the <svg>, since the symbol's own
+   attribute wins over an inherited value. */
+html.dark-mode .swagger-ui svg.arrow,
+html.dark-mode .swagger-ui svg.arrow use,
+html.dark-mode .swagger-ui .expand-operation svg,
+html.dark-mode .swagger-ui .expand-operation svg use,
+html.dark-mode .swagger-ui .models-control svg,
+html.dark-mode .swagger-ui .model-box-control svg,
+html.dark-mode .swagger-ui .opblock-control-arrow svg {{
+  fill: {TEXT} !important; color: {TEXT};
+}}
+html.dark-mode .swagger-ui .opblock-summary-control:hover svg.arrow use,
+html.dark-mode .swagger-ui .opblock-tag:hover svg.arrow use {{ fill: #ffffff !important; }}
+/* the authorize padlock keeps the accent, but has to be visible too */
+html.dark-mode .swagger-ui .authorization__btn svg,
+html.dark-mode .swagger-ui .authorization__btn svg use {{ fill: {ACCENT} !important; }}
+
+/* Method pills: black on the app's colors, not white on Swagger's pastels. */
+html.dark-mode .swagger-ui .opblock .opblock-summary-method {{
+  color: {INK_ON_COLOR}; font-weight: 700; text-shadow: none; border-radius: 6px;
+}}
+html.dark-mode .swagger-ui .opblock.opblock-get .opblock-summary-method {{ background: {M_GET}; }}
+html.dark-mode .swagger-ui .opblock.opblock-post .opblock-summary-method {{ background: {M_POST}; }}
+html.dark-mode .swagger-ui .opblock.opblock-put .opblock-summary-method {{ background: {M_PUT}; }}
+html.dark-mode .swagger-ui .opblock.opblock-patch .opblock-summary-method {{ background: {M_PATCH}; }}
+html.dark-mode .swagger-ui .opblock.opblock-delete .opblock-summary-method {{ background: {M_DELETE}; }}
+html.dark-mode .swagger-ui .opblock.opblock-head .opblock-summary-method {{ background: {M_HEAD}; }}
+html.dark-mode .swagger-ui .opblock.opblock-options .opblock-summary-method {{ background: {M_OPTIONS}; }}
+
+/* The operation row itself: one faint tint per method instead of Swagger's
+   saturated wash, so the path and summary keep their contrast. */
+html.dark-mode .swagger-ui .opblock {{ background: {CARD}; border-color: {BORDER}; }}
+html.dark-mode .swagger-ui .opblock .opblock-summary {{ border-color: {BORDER}; }}
+html.dark-mode .swagger-ui .opblock.opblock-get {{ border-color: rgba(56, 189, 248, .45); }}
+html.dark-mode .swagger-ui .opblock.opblock-post {{ border-color: rgba(16, 185, 129, .45); }}
+html.dark-mode .swagger-ui .opblock.opblock-put {{ border-color: rgba(245, 158, 11, .45); }}
+html.dark-mode .swagger-ui .opblock.opblock-patch {{ border-color: rgba(45, 212, 191, .45); }}
+html.dark-mode .swagger-ui .opblock.opblock-delete {{ border-color: rgba(239, 68, 68, .45); }}
+
+/* Path, summary and section headings were all left at Swagger's #3b4151 —
+   1.98:1 against the page. */
+html.dark-mode .swagger-ui .opblock .opblock-summary-path,
+html.dark-mode .swagger-ui .opblock .opblock-summary-path__deprecated,
+html.dark-mode .swagger-ui .opblock .opblock-summary-path a,
+html.dark-mode .swagger-ui .opblock .opblock-summary-operation-id {{
+  color: #f1f5f9; font-family: {MONO};
+}}
+html.dark-mode .swagger-ui .opblock .opblock-summary-description,
+html.dark-mode .swagger-ui .opblock-tag small,
+html.dark-mode .swagger-ui .opblock-tag small p {{ color: {MUTED}; }}
+html.dark-mode .swagger-ui .opblock-section-header {{
+  background: rgba(2, 6, 23, .55); border-color: {BORDER}; box-shadow: none;
+}}
+html.dark-mode .swagger-ui .opblock-section-header h4,
+html.dark-mode .swagger-ui .opblock-section-header > label,
+html.dark-mode .swagger-ui .opblock-section-header > label span,
+html.dark-mode .swagger-ui .opblock .opblock-section-header h4 span,
+html.dark-mode .swagger-ui .opblock-title_normal,
+html.dark-mode .swagger-ui .opblock-description-wrapper h4,
+html.dark-mode .swagger-ui .opblock-external-docs-wrapper h4 {{ color: #f1f5f9; }}
+
+/* Body copy: the API description, every operation's prose, and tables. */
+html.dark-mode .swagger-ui .markdown p, html.dark-mode .swagger-ui .markdown li,
+html.dark-mode .swagger-ui .markdown h1, html.dark-mode .swagger-ui .markdown h2,
+html.dark-mode .swagger-ui .markdown h3, html.dark-mode .swagger-ui .markdown h4,
+html.dark-mode .swagger-ui .renderedMarkdown p, html.dark-mode .swagger-ui .renderedMarkdown li,
+html.dark-mode .swagger-ui .opblock-description-wrapper p,
+html.dark-mode .swagger-ui .opblock-external-docs-wrapper p,
+html.dark-mode .swagger-ui .response-col_description,
+html.dark-mode .swagger-ui .response-col_description p,
+html.dark-mode .swagger-ui .info li, html.dark-mode .swagger-ui .info p,
+html.dark-mode .swagger-ui .info .description p,
+html.dark-mode .swagger-ui .info .base-url,
+html.dark-mode .swagger-ui .parameter__name,
+html.dark-mode .swagger-ui table tbody tr td {{ color: {TEXT}; }}
+html.dark-mode .swagger-ui .parameter__name.required span {{ color: #f87171; }}
+html.dark-mode .swagger-ui .parameter__type,
+html.dark-mode .swagger-ui .parameter__in,
+html.dark-mode .swagger-ui .parameter__deprecated,
+html.dark-mode .swagger-ui .response-col_status,
+html.dark-mode .swagger-ui .response-col_links {{ color: {MUTED}; }}
+html.dark-mode .swagger-ui .response-col_status {{ font-family: {MONO}; }}
+
+/* Inline code: amber on a translucent slate measured 1.54:1. */
+html.dark-mode .swagger-ui .markdown code, html.dark-mode .swagger-ui .renderedMarkdown code,
+html.dark-mode .swagger-ui .info code, html.dark-mode .swagger-ui .info .description code {{
+  background: rgba(2, 6, 23, .85); color: {CODE}; border: 1px solid {BORDER};
+  padding: 1px 5px; border-radius: 5px; font-family: {MONO};
+}}
+/* Swagger sets the prose line-height from its own theme; the description block
+   ran its lines into each other once code spans raised their height. */
+html.dark-mode .swagger-ui .info .description p,
+html.dark-mode .swagger-ui .markdown p, html.dark-mode .swagger-ui .renderedMarkdown p {{
+  line-height: 1.7;
+}}
+
+/* Controls that sit on a filled surface take the same black text. */
+html.dark-mode .swagger-ui .opblock .btn.execute,
+html.dark-mode .swagger-ui .btn.execute {{ color: {INK_ON_COLOR}; font-weight: 600; }}
+html.dark-mode .swagger-ui .info .title small.version-stamp,
+html.dark-mode .swagger-ui .info .title small.version-stamp pre {{
+  background: {ACCENT}; color: {INK_ON_COLOR};
+}}
+html.dark-mode .swagger-ui .info .title small pre {{ color: {TEXT}; }}
+html.dark-mode .swagger-ui .response-control-media-type--accept-controller select {{
+  border-color: {ACCENT};
+}}
+html.dark-mode .swagger-ui .response-control-media-type__accept-message {{ color: {ACCENT}; }}
 """
 
 CHROME_CSS = f"""
@@ -184,6 +339,28 @@ body {{ margin: 0; background: {BG}; color: {TEXT}; }}
 #redoc a {{ color: {ACCENT}; }}
 #redoc code, #redoc pre {{ background: {BG}; color: {CODE}; }}
 #redoc svg {{ fill: currentColor; }}
+
+/* The media-type heading above each request/response sample
+   ("application/json", "text/plain") renders as pure black — 1.04:1 against
+   the panel behind it, so the label is simply not there. It is a plain <h5>,
+   which is stable enough to target even though its class is an emotion hash. */
+#redoc h5, #redoc h5 span {{ color: {TEXT} !important; }}
+
+/* ReDoc paints the *selected* sample tab using the theme's primary **text**
+   colour as its background, then leaves the label that same colour — light on
+   light, measured at 1.0:1, i.e. the selected tab's text vanishes exactly when
+   it is the one you are reading. The class names here come from the react-tabs
+   library and ReDoc's own status modifiers, not from emotion, so they hold. */
+#redoc .react-tabs__tab {{ color: {MUTED}; background: transparent; border-radius: 6px 6px 0 0; }}
+#redoc .react-tabs__tab--selected {{ background: {RAISED} !important; color: {TEXT} !important; }}
+#redoc .react-tabs__tab--selected.tab-success {{ color: {ACCENT} !important; }}
+#redoc .react-tabs__tab--selected.tab-error {{ color: #f87171 !important; }}
+#redoc .react-tabs__tab--selected.tab-redirect {{ color: {CODE} !important; }}
+#redoc .react-tabs__tab--selected.tab-info {{ color: {TYPE} !important; }}
+
+/* Response accordions carry a translucent status tint; the heading on top of
+   it was still the muted body colour. */
+#redoc h3, #redoc h3 span, #redoc button h3 {{ color: #f8fafc; }}
 {CHROME_CSS}
 """
 
@@ -224,9 +401,9 @@ Redoc.init("__SPEC__", {
         redirect: { color: "#fbbf24",   backgroundColor: "rgba(201,133,0,.12)" },
         info:     { color: "__TYPE__",  backgroundColor: "rgba(57,135,229,.12)" }
       },
-      http: { get: "#3987e5", post: "__ACCENT__", put: "#c98500", options: "#7dd3fc",
-              patch: "#d55181", delete: "#d03b3b", basic: "__MUTED__",
-              link: "__TYPE__", head: "#b889ff" }
+      http: { get: "__R_GET__", post: "__R_POST__", put: "__R_PUT__",
+              options: "__R_OPTIONS__", patch: "__R_PATCH__", delete: "__R_DELETE__",
+              basic: "__MUTED__", link: "__TYPE__", head: "__R_HEAD__" }
     },
     typography: {
       fontSize: "15px", lineHeight: "1.6",
@@ -355,6 +532,9 @@ def install(app: FastAPI, app_url: str, public: bool = True) -> None:
             "__BG__": BG, "__CARD__": CARD, "__BORDER__": BORDER, "__TEXT__": TEXT,
             "__MUTED__": MUTED, "__ACCENT__": ACCENT, "__CODE__": CODE, "__TYPE__": TYPE,
             "__RAISED__": RAISED,
+            "__R_GET__": R_GET, "__R_POST__": R_POST, "__R_PUT__": R_PUT,
+            "__R_PATCH__": R_PATCH, "__R_DELETE__": R_DELETE,
+            "__R_HEAD__": R_HEAD, "__R_OPTIONS__": R_OPTIONS,
             "__FONT__": FONT, "__MONO__": MONO,
         }.items():
             html = html.replace(key, value)

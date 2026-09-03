@@ -27,6 +27,47 @@ interface DeviceT {
   expires_at: string;
 }
 
+/** One entry in the account's security log. `ip` is the originating address as
+ *  the deployment resolved it — behind a reverse proxy that depends on
+ *  TRUSTED_PROXY_CIDRS naming the proxy. */
+interface SecurityEventT {
+  id: string;
+  kind: string;
+  ip: string;
+  device: string | null;
+  detail: string | null;
+  created_at: string;
+}
+
+const EVENT_LABEL: Record<string, string> = {
+  SIGN_IN: "Signed in",
+  SIGN_IN_BLOCKED: "Sign-in refused",
+  LOCKOUT: "Account locked",
+  DEVICE_CODE_SENT: "Sign-in code emailed",
+  DEVICE_TRUSTED: "Device remembered",
+  DEVICES_REVOKED: "Devices cleared",
+  PASSWORD_CHANGED: "Password changed",
+  PASSWORD_RESET_REQUESTED: "Password reset requested",
+  PASSWORD_RESET_COMPLETED: "Password reset",
+  EMAIL_CHANGE_REQUESTED: "Email change requested",
+  EMAIL_CHANGED: "Email changed",
+  PASSKEY_ADDED: "Passkey added",
+  PASSKEY_REMOVED: "Passkey removed",
+  PASSWORDLESS_ENABLED: "Password sign-in turned off",
+  PASSWORDLESS_DISABLED: "Password sign-in turned on",
+  MFA_ENABLED: "Authenticator enabled",
+  MFA_DISABLED: "Authenticator disabled",
+  API_KEY_CREATED: "API key created",
+  API_KEY_REVOKED: "API key revoked",
+};
+
+/** Events that mean something changed, rather than something happened. */
+const EVENT_NOTABLE = new Set([
+  "LOCKOUT", "SIGN_IN_BLOCKED", "PASSWORD_CHANGED", "PASSWORD_RESET_COMPLETED",
+  "EMAIL_CHANGED", "PASSKEY_ADDED", "PASSKEY_REMOVED", "PASSWORDLESS_ENABLED",
+  "MFA_DISABLED", "API_KEY_CREATED",
+]);
+
 /** Passwordless needs a spare authenticator; the server enforces the same
  *  floor, this just keeps the button from promising something it can't do. */
 const MIN_PASSWORDLESS_KEYS = 2;
@@ -85,6 +126,7 @@ export default function SettingsPage() {
   const [pwlCode, setPwlCode] = useState("");
   const [pwlError, setPwlError] = useState("");
   const [devices, setDevices] = useState<DeviceT[] | null>(null);
+  const [events, setEvents] = useState<SecurityEventT[] | null>(null);
 
   const [busy, setBusy] = useState(false);
 
@@ -92,6 +134,8 @@ export default function SettingsPage() {
     api<MeT>("/auth/me").then(setMe).catch(() => {});
     api<PasskeyT[]>("/auth/passkeys").then(setPasskeys).catch(() => setPasskeys([]));
     api<DeviceT[]>("/auth/devices").then(setDevices).catch(() => setDevices([]));
+    api<SecurityEventT[]>("/auth/security/activity?limit=50")
+      .then(setEvents).catch(() => setEvents([]));
   }
   useEffect(load, []);
 
@@ -531,6 +575,45 @@ export default function SettingsPage() {
         )}
       </Card>
 
+      {/* The IP column is the reason this card exists: "was that me?" is a
+          question about where something came from, and nothing else on this
+          page answers it. */}
+      <Card title="Security activity">
+        <p className="mb-3 text-sm text-slate-400">
+          Sign-ins and security changes on this account, newest first, with the address
+          each came from. Anything you don&apos;t recognise is worth a password change.
+        </p>
+        {!events ? (
+          <Spinner />
+        ) : events.length === 0 ? (
+          <Empty>No security activity recorded yet.</Empty>
+        ) : (
+          <ul className="divide-y divide-slate-800/60">
+            {events.map((e) => (
+              <li key={e.id} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 py-2">
+                <span
+                  className={`text-sm font-medium ${
+                    EVENT_NOTABLE.has(e.kind) ? "text-amber-300" : "text-slate-200"
+                  }`}
+                >
+                  {EVENT_LABEL[e.kind] ?? e.kind}
+                </span>
+                {e.detail && (
+                  <span className="min-w-0 break-all text-xs text-slate-400">{e.detail}</span>
+                )}
+                <span className="ml-auto shrink-0 text-xs text-slate-500">
+                  {dateTime(e.created_at)}
+                </span>
+                <span className="w-full text-xs text-slate-500">
+                  <span className="tabular-nums">{e.ip}</span>
+                  {e.device && ` · ${e.device}`}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
       <Card
         title="Remembered devices"
         action={
@@ -542,14 +625,15 @@ export default function SettingsPage() {
         }
       >
         <p className="mb-3 text-sm text-slate-400">
-          When an account has no passkey and no authenticator app, a sign-in from an
-          unrecognised browser has to clear a code emailed to you. Browsers that have
-          cleared it are listed here and skip the step until they expire.
+          A sign-in that presents only your password, from a browser we don&apos;t
+          recognise, has to clear a code emailed to you — whether or not this account
+          also has a passkey or an authenticator. Browsers that have cleared it are
+          listed here and skip the step until they expire.
         </p>
-        {(me.mfa_enabled || (passkeys?.length ?? 0) > 0) && (
+        {(passkeys?.length ?? 0) > 0 && (
           <InfoText>
-            This account has a stronger second factor, so the emailed-code step does not
-            apply to it and no new devices will be recorded.
+            Signing in with a passkey skips this step entirely: it is bound to this site
+            and to your device, so there is nothing left to verify.
           </InfoText>
         )}
         {!devices ? (

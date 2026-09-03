@@ -293,7 +293,8 @@ export default function ExchangeForm({ accounts, onExecuted }: {
                   <summary className="cursor-pointer text-xs text-slate-400 hover:text-slate-200">
                     Lots being sold ({preview.lots.length}) · {preview.cost_basis_method}
                   </summary>
-                  <table className="table-base mt-2">
+                  <div className="mt-2 overflow-x-auto">
+                  <table className="table-base">
                     <thead>
                       <tr><th>Acquired</th><th>Shares</th><th>Cost</th><th>Gain</th><th>Term</th></tr>
                     </thead>
@@ -314,6 +315,7 @@ export default function ExchangeForm({ accounts, onExecuted }: {
                       ))}
                     </tbody>
                   </table>
+                  </div>
                 </details>
               )}
 

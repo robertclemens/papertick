@@ -43,6 +43,10 @@ have.
 - **Scenarios** — independent what-if tracks. Copy your portfolio, try something reckless
   in the copy, throw it away.
 - **A real API** — scoped keys, an OpenAPI spec, and no feature that is UI-only.
+- **Account security you can audit** — passkeys, optional TOTP, an emailed code for a
+  password sign-in from an unrecognised browser, single-use password recovery, and a
+  security log that records the originating IP of every sign-in and change. Anything
+  worth knowing about is emailed too.
 
 Full inventory: [docs/features.md](docs/features.md).
 
@@ -143,6 +147,8 @@ COOKIE_SECURE=true                         # you are behind TLS
 FRONTEND_ORIGIN=https://papertick.example  # scheme + host, never a path
 ALLOWED_HOSTS=backend,127.0.0.1            # Host values the BACKEND sees, not your domain
 SMTP_HOST=smtp.example.com                 # + SMTP_USER / SMTP_PASSWORD / SMTP_FROM
+TRUST_PROXY_HEADERS=true                   # a reverse proxy sets X-Forwarded-For
+TRUSTED_PROXY_CIDRS=172.16.0.0/12          # ...and the backend may believe it
 ```
 
 ```bash
@@ -154,6 +160,16 @@ Neither container terminates TLS, so put a reverse proxy in front of `frontend` 
 configs for both a dedicated hostname and a `/subfolder` deployment. Leave
 `DEMO_MODE=false`, and generate secrets fresh for the deployment rather than reusing
 the ones from your laptop.
+
+`SMTP_HOST` is not optional in production: password recovery, the new-device code
+and every security notice are delivered by email, and without a relay they cannot
+be sent at all.
+
+The last two settings are what makes the security log record the visitor's address
+rather than the frontend container's. Set them **only** with a proxy actually in
+front — exposing `frontend` directly and turning them on lets any caller name its
+own IP. [docs/reverse-proxy.md](docs/reverse-proxy.md#recording-the-clients-ip-address)
+explains both shapes.
 
 ## Using it from a script or an agent
 
@@ -340,8 +356,8 @@ data are created on backend start by `backend/app/init_db.py`.
 | [The REST API](docs/api.md) | Auth, scopes, scenarios, endpoint map, worked examples |
 | [Market data](docs/market-data.md) | Providers, the price-convention rules, caching, what triggers a fetch |
 | [Accounting, tax and performance](docs/accounting.md) | Tax lots, IRA mechanics, how returns are computed |
-| [Authentication and security](docs/auth-and-security.md) | Passkeys, MFA, device verification, the security posture |
-| [Reverse proxy](docs/reverse-proxy.md) | Caddy, nginx and Apache configs; sub-folder deployments |
+| [Authentication and security](docs/auth-and-security.md) | Passkeys, MFA, device verification, password recovery, the security log |
+| [Reverse proxy](docs/reverse-proxy.md) | Caddy, nginx and Apache configs; sub-folder deployments; recording client IPs |
 | [Running on Podman](docs/podman.md) | Rootless Podman, and the two places it differs from Docker |
 | [Upgrading](docs/upgrading.md) | `upgrade.sh`, dependency policy, Postgres major versions |
 | [Dependencies](docs/dependencies.md) | Every pinned package and image, and what it is for |

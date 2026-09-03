@@ -48,6 +48,47 @@ minimum distributions, the individual exceptions to the 10% penalty (recorded as
 an attestation instead — each needs facts the platform cannot see), state income
 tax, and the net investment income tax.
 
+## What each cash movement is called
+
+Every dollar entering or leaving an account is one row with one kind, and the
+kind decides which annual limit it consumes and which line it lands on in the
+tax summary. Getting it wrong does not lose money — it misreports it.
+
+| Kind | Consumes IRA room | On the Taxes page |
+|---|---|---|
+| `CONTRIBUTION` | yes, in its designated tax year | IRA contributions |
+| `ROLLOVER` | no | Rollovers received |
+| `OPENING_BALANCE` | no | Opening balances |
+| `WITHDRAWAL` | — | Withdrawals |
+| `CONVERSION` | no | Roth conversions |
+
+`OPENING_BALANCE` is the value an account was carried in with when a scenario
+was copied: its cash plus the market value of its holdings, so the new track's
+performance starts at zero instead of inheriting gains earned elsewhere. It is
+not a contribution — the money was already inside the wrapper — and it is not a
+rollover, which is a specific reportable event. It used to be written as a
+rollover, which added the whole value of every copied account to "rollovers
+received", and put a rollover on taxable brokerage accounts, which cannot
+receive one at all. Existing rows are reclassified on startup.
+
+Two gates keep the distinction from eroding:
+
+- A **taxable brokerage account cannot receive a rollover.** There is no such
+  event for a non-tax-advantaged account.
+- A **rollover into a Roth IRA** is accepted — Roth 401(k) money and Roth-to-Roth
+  transfers are real — but says what it must be. Pre-tax money moved into a Roth
+  is a *conversion*: ordinary income, and it starts its own five-year clock, so
+  it has to be recorded as one.
+- An **opening balance cannot be deposited** through the API. It is written by a
+  scenario copy and nothing else; accepting one would let external money into an
+  IRA outside the annual limit just by naming a different kind.
+
+**Scenarios are scoped, everywhere.** Each scenario is an independent track with
+its own contribution history, so the annual limit, the tax summary and the
+birthdate-impact check are all computed within one scenario. Summing across them
+is not a bigger number, it is a wrong one — two tracks holding the same imported
+history would report double the contributions and double the rollovers.
+
 ## How performance is calculated
 
 Every performance figure in the product — the dashboard chart, the windowed

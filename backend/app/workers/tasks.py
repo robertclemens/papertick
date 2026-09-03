@@ -305,6 +305,30 @@ def accrue_settlement_dividends() -> str:
 
 
 @celery.task
+def prune_security_events() -> int:
+    """Drop security-log rows past the retention window.
+
+    The log is an audit trail, not a permanent record of everywhere someone has
+    ever signed in from: it keeps long enough to investigate something noticed
+    late, and no longer.
+    """
+    from app.services.audit import prune
+
+    db = get_sessionmaker()()
+    try:
+        n = prune(db)
+        db.commit()
+        if n:
+            log.info("pruned %d security event(s)", n)
+        return n
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@celery.task
 def purge_expired_scenarios() -> int:
     """Destroy deleted scenarios whose retention window has run out."""
     from app.services.scenarios import purge_expired

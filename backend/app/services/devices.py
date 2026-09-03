@@ -1,9 +1,11 @@
 """Trusted-device recognition and the new-device email OTP.
 
-This is the *fallback* second factor, not an extra one. It applies only when
-an account has neither a passkey nor an authenticator enrolled, and only in
-production — in development a new browser signs in on the password alone, or
-nobody could log into a fresh checkout without a working SMTP relay.
+This is what the *password* path proves on an unrecognised browser, and it
+applies in production to every password sign-in that cannot show a device
+token — including accounts that also hold passkeys. Enrolling a passkey makes
+the passkey route available; it does not make a password sign-in stronger. In
+development it is skipped entirely, or nobody could log into a fresh checkout
+without a working SMTP relay.
 
 The shape is the familiar one: a successful sign-in leaves a long-lived,
 HttpOnly cookie holding a random secret; only its SHA-256 is stored, so
@@ -28,9 +30,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import TrustedDevice, User, WebAuthnCredential, utcnow
+from app.models import TrustedDevice, User, WebAuthnCredential, as_utc, utcnow
 from app.rate_limit import get_redis
-from app.services.mailer import send_email
+from app.services.audit import device_label
+from app.services.mailer import send_rendered, utc_stamp
 
 log = logging.getLogger("papertick.devices")
 
@@ -49,26 +52,40 @@ def cookie_path() -> str:
 
 # --------------------------------------------------------------- applicability
 
-def has_second_factor(db: Session, user: User) -> bool:
-    """True when the account already carries something stronger than a password."""
-    if user.mfa_enabled:
-        return True
+def has_passkey(db: Session, user: User) -> bool:
+    """Whether the account has any passkey enrolled.
+
+    Deliberately *not* consulted when deciding whether a sign-in needs a
+    device code: see `verification_required`.
+    """
     return db.execute(
         select(WebAuthnCredential.id).where(WebAuthnCredential.user_id == user.id).limit(1)
     ).first() is not None
 
 
 def verification_required(db: Session, user: User, request: Request) -> bool:
-    """Does this sign-in need a new-device code?
+    """Does this password sign-in need a new-device code?
 
-    No in development, no when the deployment has turned it off, no when the
-    account has a real second factor, and no when the browser presents a token
-    this account has used before.
+    No in development, no when the deployment has turned it off, and no when
+    the browser presents a device token this account has used before.
+    Otherwise: yes.
+
+    What is deliberately *not* a reason to skip it is the account having a
+    passkey or an authenticator enrolled. This used to check exactly that, and
+    it is a factor-confusion bug: a credential the account *could* have used
+    is not a credential this sign-in *did* use. An account with one passkey
+    signed in on the password alone, from a browser nobody had ever seen,
+    with no code and no email — the passkey's strength was credited to a
+    sign-in that never touched it.
+
+    Only callers on the password path reach here, and only after the factor
+    they actually presented has been checked. TOTP is handled before this by
+    `/login` returning `mfa_required`, so a code really was entered; a passkey
+    sign-in goes through its own route and never asks. Here the sole evidence
+    is a password, so an unrecognised browser gets a code.
     """
     s = get_settings()
     if not (s.device_verification and s.is_production):
-        return False
-    if has_second_factor(db, user):
         return False
     return not is_trusted(db, user, request.cookies.get(DEVICE_COOKIE))
 
@@ -85,28 +102,11 @@ def is_trusted(db: Session, user: User, raw: str | None) -> bool:
             TrustedDevice.revoked_at.is_(None),
         )
     ).scalar_one_or_none()
-    if row is None or row.expires_at <= utcnow():
+    if row is None or as_utc(row.expires_at) <= utcnow():
         return False
     row.last_seen_at = utcnow()
     db.commit()
     return True
-
-
-def _label(request: Request) -> str:
-    """A human-recognisable name for the row, from the User-Agent.
-
-    Deliberately coarse — browser and platform family, nothing more. This
-    exists so the user can tell one row from another in Settings, not to
-    fingerprint the device.
-    """
-    ua = (request.headers.get("user-agent") or "")[:400]
-    browser = next((b for b in ("Edg", "OPR", "Chrome", "Firefox", "Safari") if b in ua), None)
-    browser = {"Edg": "Edge", "OPR": "Opera"}.get(browser, browser) or "Browser"
-    platform = next(
-        (p for p in ("Windows", "Macintosh", "iPhone", "iPad", "Android", "Linux") if p in ua),
-        "Unknown device",
-    )
-    return f"{browser} on {'macOS' if platform == 'Macintosh' else platform}"[:120]
 
 
 def remember(db: Session, user: User, request: Request, response: Response) -> None:
@@ -119,7 +119,7 @@ def remember(db: Session, user: User, request: Request, response: Response) -> N
     db.add(TrustedDevice(
         user_id=user.id,
         token_hash=_hash(raw),
-        label=_label(request),
+        label=device_label(request),
         last_ip=client_ip(request)[:45],
         expires_at=utcnow() + ttl,
         last_seen_at=utcnow(),
@@ -130,6 +130,11 @@ def remember(db: Session, user: User, request: Request, response: Response) -> N
         max_age=int(ttl.total_seconds()), httponly=True,
         samesite="lax", secure=s.cookie_secure, path=cookie_path(),
     )
+    from app.models import SecurityEventKind
+    from app.services import audit
+
+    audit.record(db, user, SecurityEventKind.DEVICE_TRUSTED, request)
+    db.commit()
 
 
 def forget_cookie(response: Response) -> None:
@@ -190,16 +195,27 @@ def start_challenge(db: Session, user: User, request: Request) -> str:
         log.error("device OTP store unavailable")
         raise
     minutes = max(1, s.device_otp_ttl_seconds // 60)
-    send_email(
-        user.email,
-        "Your PaperTick sign-in code",
-        f"Someone signed in to PaperTick from a device we don't recognise "
-        f"({_label(request)}).\n\n"
-        f"Your one-time code is: {code}\n\n"
-        f"It expires in {minutes} minutes. If this wasn't you, change your "
-        f"password — and consider adding a passkey or an authenticator app, "
-        f"which replace this step entirely.",
+    from app.rate_limit import client_ip
+
+    send_rendered(
+        user.email, "Your PaperTick sign-in code",
+        heading=f"Your sign-in code is {code}",
+        lede=("Someone signed in to PaperTick with your password from a browser we "
+              "don't recognise. Enter this code to finish signing in."),
+        rows=[("Code", code),
+              ("Expires in", f"{minutes} minutes"),
+              ("When", utc_stamp()),
+              ("IP address", client_ip(request)),
+              ("Device", device_label(request))],
+        closing=("If this wasn't you, someone has your password: reset it now and review "
+                 "your security activity in Settings. We will never ask you for this code."),
+        alert=True,
     )
+    from app.models import SecurityEventKind
+    from app.services import audit
+
+    audit.record(db, user, SecurityEventKind.DEVICE_CODE_SENT, request)
+    db.commit()
     log.info("new-device code issued for %s", user.id)
     return challenge_id
 

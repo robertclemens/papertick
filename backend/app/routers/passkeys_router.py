@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.deps import Principal, require_manage
-from app.models import WebAuthnCredential
+from app.models import SecurityEventKind, WebAuthnCredential
 from app.rate_limit import rate_limiter
 from app.models import User
 from app.schemas import (
@@ -17,7 +17,7 @@ from app.schemas import (
     UserOut,
 )
 from app import security
-from app.services import passkeys
+from app.services import audit, passkeys
 
 router = APIRouter(prefix="/auth/passkeys", tags=["passkeys"])
 
@@ -60,13 +60,16 @@ def register_options(data: PasskeyRegisterStartIn,
 
 
 @router.post("/register/verify", response_model=PasskeyOut, status_code=201)
-def register_verify(data: PasskeyRegisterVerifyIn,
+def register_verify(data: PasskeyRegisterVerifyIn, request: Request,
                     principal: Principal = Depends(require_manage),
                     db: Session = Depends(get_db)) -> PasskeyOut:
     """Completes the registration ceremony: verifies the browser's response
     against the challenge from `/register/options` and, on success, saves the
     new passkey to the account."""
     row = passkeys.verify_registration(db, principal.user, data.credential, data.nickname)
+    audit.notify(db, principal.user, SecurityEventKind.PASSKEY_ADDED, request,
+                 detail=row.nickname, extra_rows=[("Passkey", row.nickname)])
+    db.commit()
     return PasskeyOut.model_validate(row)
 
 
@@ -83,7 +86,8 @@ def list_passkeys(principal: Principal = Depends(require_manage),
 
 
 @router.delete("/{passkey_id}", status_code=204)
-def delete_passkey(passkey_id: str, principal: Principal = Depends(require_manage),
+def delete_passkey(passkey_id: str, request: Request,
+                   principal: Principal = Depends(require_manage),
                    db: Session = Depends(get_db)) -> None:
     """Deletes a passkey. Returns 404 for an id that doesn't exist or belongs
     to another user, rather than distinguishing the two.
@@ -101,12 +105,16 @@ def delete_passkey(passkey_id: str, principal: Principal = Depends(require_manag
                     f"least {MIN_PASSWORDLESS_KEYS} of them. Register another passkey "
                     "first, or turn password sign-in back on."),
         )
+    nickname = row.nickname
     db.delete(row)
+    audit.notify(db, principal.user, SecurityEventKind.PASSKEY_REMOVED, request,
+                 detail=nickname, extra_rows=[("Passkey", nickname)])
     db.commit()
 
 
 @router.post("/passwordless", response_model=UserOut)
-def set_passwordless(data: PasswordlessIn, principal: Principal = Depends(require_manage),
+def set_passwordless(data: PasswordlessIn, request: Request,
+                     principal: Principal = Depends(require_manage),
                      db: Session = Depends(get_db)) -> UserOut:
     """Turn the password sign-in path off (or back on) for this account.
 
@@ -124,6 +132,10 @@ def set_passwordless(data: PasswordlessIn, principal: Principal = Depends(requir
                     "off password sign-in, so losing one device does not lock you out."),
         )
     user.passkey_only = data.enabled
+    audit.notify(db, user,
+                 SecurityEventKind.PASSWORDLESS_ENABLED if data.enabled
+                 else SecurityEventKind.PASSWORDLESS_DISABLED,
+                 request)
     db.commit()
     return UserOut.model_validate(user)
 
@@ -141,7 +153,7 @@ def login_options() -> dict:
 
 @router.post("/login/verify", response_model=LoginOut,
              dependencies=[Depends(rate_limiter("pk-verify", 30, 60))])
-def login_verify(data: PasskeyLoginVerifyIn, response: Response,
+def login_verify(data: PasskeyLoginVerifyIn, request: Request, response: Response,
                  db: Session = Depends(get_db)) -> LoginOut:
     """Completes passkey login: verifies the signed challenge against the
     stored public key and, on success, issues session tokens directly.
@@ -158,5 +170,13 @@ def login_verify(data: PasskeyLoginVerifyIn, response: Response,
     """
     from app.routers.auth import _issue_tokens
 
+    from app.services import password_reset
+
     user = passkeys.verify_authentication(db, data.flow_id, data.credential)
-    return LoginOut(tokens=_issue_tokens(db, user, response))
+    # Signing in successfully means the owner is present, so any outstanding
+    # reset link is no longer wanted.
+    password_reset.burn_outstanding(db, user.id)
+    tokens = _issue_tokens(db, user, response)
+    audit.record(db, user, SecurityEventKind.SIGN_IN, request, detail="passkey")
+    db.commit()
+    return LoginOut(tokens=tokens)

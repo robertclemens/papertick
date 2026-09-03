@@ -229,6 +229,29 @@ class PasswordChangeIn(BaseModel):
     new_password: str = Field(min_length=1, max_length=512)
 
 
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    """Redeems a reset link. The token is the only identifier — no email is
+    accepted alongside it, so a valid link cannot be pointed at a different
+    account."""
+
+    token: str = Field(min_length=10, max_length=512)
+    new_password: str = Field(min_length=1, max_length=512)
+
+
+class SecurityEventOut(ORMModel):
+    id: str
+    kind: str
+    #: as this deployment resolved it; see TRUSTED_PROXY_CIDRS
+    ip: str
+    device: str | None
+    detail: str | None
+    created_at: datetime
+
+
 class ProfileUpdateIn(BaseModel):
     email: EmailStr | None = None
     first_name: str | None = Field(default=None, max_length=60)
@@ -806,7 +829,7 @@ class MonthEventOut(BaseModel):
     """One thing that happened inside a month — the drill-down behind a row."""
 
     date: date
-    kind: str          # CONTRIBUTION | WITHDRAWAL | ROLLOVER | BUY | SELL | DIVIDEND
+    kind: str          # CONTRIBUTION | WITHDRAWAL | ROLLOVER | OPENING_BALANCE | BUY | SELL | DIVIDEND
     account: str
     description: str
     amount: Decimal    # signed as it hit the account
@@ -1081,6 +1104,10 @@ class TaxYearSummaryOut(BaseModel):
     roth_withdrawals: Decimal
     ira_contributions: Decimal        # designated to this tax year
     rollovers: Decimal
+    # Value an account was opened with when a scenario was copied: external
+    # money in, but neither a contribution (it consumes no annual room) nor a
+    # reportable rollover.
+    opening_balances: Decimal = Decimal("0")
     # Roth conversions: gross moved, and the part that is ordinary income
     conversions: Decimal = Decimal("0")
     conversion_taxable: Decimal = Decimal("0")

@@ -188,6 +188,47 @@ COOKIE_SECURE=true
 BASE_PATH=/papertick
 ```
 
+## Recording the client's IP address
+
+The backend keys its rate limiters on the caller's address and stamps it on every
+row of the account security log (Settings → Security activity). Two settings
+decide what that address is, and **both** are required — either alone does
+nothing:
+
+```dotenv
+TRUST_PROXY_HEADERS=true              # frontend: the inbound XFF is authoritative
+TRUSTED_PROXY_CIDRS=172.16.0.0/12     # backend: believe the chain from the compose network
+```
+
+Why two. The frontend proxies `/api` to the backend, so the *peer* the backend
+sees is always the frontend container — `TRUSTED_PROXY_CIDRS` is what lets it
+look past that to the forwarded chain, and `172.16.0.0/12` covers the default
+Docker bridge. But Next only fills `X-Forwarded-For` in when the request arrives
+without one; a header the client supplied is passed through **verbatim**, not
+appended to. `TRUST_PROXY_HEADERS` is the statement that something upstream has
+already made that header trustworthy. With it off, the frontend strips
+`X-Forwarded-For` and `X-Real-IP` before proxying, so a forged one cannot reach
+the backend at all.
+
+The chain is read from the **right**, stopping at the first hop that is not a
+trusted proxy. That is what makes it forgery-resistant: a client that sends
+`X-Forwarded-For: 9.9.9.9` gets its own address appended by Caddy, and the
+backend reads the appended one. The left-most entry is never used.
+
+### If the frontend is exposed directly
+
+Leave both at their defaults — `TRUST_PROXY_HEADERS=false` and an empty
+`TRUSTED_PROXY_CIDRS`. With nothing in front, every `X-Forwarded-For` is client
+input and there is no way to tell a real hop from an invented one; trusting it
+would let any caller appear in the security log as an address of their choosing,
+and share or poison another address's rate-limit bucket.
+
+The cost is that security-log rows record the frontend container's address rather
+than the visitor's. If you need the real one, put a reverse proxy in front — that
+is the only place the client's address is known for certain.
+
+Nothing else depends on these: sign-in, passkeys and cookies all work either way.
+
 `ALLOWED_HOSTS` does **not** take your public hostname, and does not change when
 the public address does. The frontend proxies `/api` to the backend with
 `changeOrigin`, which rewrites `Host` to the upstream's own name — so the backend

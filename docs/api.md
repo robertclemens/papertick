@@ -126,7 +126,7 @@ curl -s -H "Authorization: Bearer $PT_KEY" \
 | Monthly and year-end PDFs | `/statements…` | `read` |
 | CSV / Excel history exports | `/export/{dataset}.{csv,xlsx}` | `read` |
 | Scenario create, copy, export, import, delete | `/scenarios…` | `manage` |
-| Login, MFA, passkeys, profile, API keys | `/auth…`, `/api-keys…` | session |
+| Login, MFA, passkeys, password recovery, security log, profile, API keys | `/auth…`, `/api-keys…` | session |
 
 All under `/api/v1`. `GET /healthz` sits outside it and needs no credential.
 

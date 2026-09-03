@@ -144,7 +144,13 @@ def is_locked_out(email: str, ip: str) -> bool:
         )
 
 
-def record_login_failure(email: str, ip: str) -> None:
+def record_login_failure(email: str, ip: str) -> bool:
+    """Count one failure. Returns True on the failure that engages the lockout.
+
+    The transition is reported, not the state, so the caller can email the
+    account owner exactly once — telling them on every subsequent attempt
+    would turn a break-in alert into a mail flood the attacker controls.
+    """
     try:
         r = get_redis()
         k = _lock_key(email, ip)
@@ -154,8 +160,10 @@ def record_login_failure(email: str, ip: str) -> None:
         r.expire(k, get_settings().login_lockout_seconds)
         if n == get_settings().login_max_failures:
             log.warning("login lockout engaged for %s from %s", email, ip)
+            return True
     except redis.RedisError:
         pass
+    return False
 
 
 def clear_login_failures(email: str, ip: str) -> None:

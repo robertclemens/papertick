@@ -267,7 +267,7 @@ export default function DashboardPage() {
               title="Performance"
               className="lg:col-span-2"
               action={
-                <div className="flex gap-1" role="group" aria-label="Date range">
+                <div className="flex flex-wrap gap-1" role="group" aria-label="Date range">
                   {RANGES.map((r) => (
                     <button
                       key={r}
@@ -352,7 +352,7 @@ export default function DashboardPage() {
             <Card
               title="Allocation"
               action={
-                <div className="flex gap-1" role="group" aria-label="Allocation view">
+                <div className="flex flex-wrap gap-1" role="group" aria-label="Allocation view">
                   {ALLOC_VIEWS.map((v) => (
                     <button
                       key={v.key}

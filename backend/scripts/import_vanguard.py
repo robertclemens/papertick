@@ -70,7 +70,8 @@ from collections import defaultdict
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
-from sqlalchemy import select
+from fastapi import HTTPException
+from sqlalchemy import func, select
 
 from app.db import get_sessionmaker
 from app.models import (
@@ -369,7 +370,8 @@ def import_account(db, user: User, account: Account, rows: list[Row],
         repay()
         if row.kind == "cash_in":
             memo = MANUAL_MEMO if row.raw_type == "--fund" else IMPORT_MEMO
-            _deposit(db, account, row.settles, row.amount, is_ira, memo)
+            _deposit(db, user, account, row.settles, row.amount, is_ira, memo,
+                     row.raw_type, stats)
             stats["deposits"] += 1
             continue
 
@@ -430,7 +432,7 @@ def import_account(db, user: User, account: Account, rows: list[Row],
         last = rows[-1].settles if rows else date.today()
         inferred.append((last, "", credit))
         stats["inferred_deposits"] += 1
-        _deposit(db, account, last, credit, is_ira, FUNDING_MEMO)
+        _deposit(db, user, account, last, credit, is_ira, FUNDING_MEMO, "", stats)
         repay()
 
     db.flush()
@@ -447,16 +449,78 @@ def import_account(db, user: User, account: Account, rows: list[Row],
     }
 
 
-def _deposit(db, account: Account, day: date, amount: Decimal, is_ira: bool, memo: str) -> None:
+def _annual_limit(db, user: User, tax_year: int) -> Decimal | None:
+    """The user's IRA contribution limit for `tax_year`, or None if the year
+    has no configured limit (nothing to check against)."""
+    from app.services import irs
+
+    try:
+        limit, _ = irs.user_limit(db, user, tax_year)
+    except HTTPException:
+        return None
+    return limit
+
+
+def _deposit(db, user: User, account: Account, day: date, amount: Decimal,
+             is_ira: bool, memo: str, raw_type: str, stats) -> None:
+    """Book one cash-in, classified the way the export classifies it.
+
+    Two things were wrong here, and both inflated "IRA contributions".
+
+    The export names each cash movement — "Contribution", "Rollover", "Funds
+    Received" — and every one of them used to be written as a regular annual
+    contribution designated to the settlement year. A rollover is not a
+    contribution: it has no annual limit, and recording it as one both
+    overstates the year's contributions and eats room the user still has.
+
+    The second is the limit itself. A custodian will not accept a regular
+    contribution above the annual limit, so cash-in beyond it in a real export
+    is something else — a transfer in from another institution, a rollover, a
+    recharacterization. Whatever it is, it is not a contribution, and calling
+    it one is how a Roth IRA ends up reporting $10,666 of contributions against
+    a $6,000 limit. What fits the limit is booked as a contribution; the rest
+    is carried as a transfer in and flagged for review, so the cash is still
+    there and the tax year is still honest.
+    """
     amount = q_money(amount)
-    db.add(Contribution(
-        account_id=account.id,
-        tax_year=day.year if is_ira else None,
-        amount=amount,
-        kind=CashFlowKind.CONTRIBUTION,
-        memo=memo,
-        timestamp=datetime.combine(day, time(12, 0), tzinfo=timezone.utc),
-    ))
+    stamp = datetime.combine(day, time(12, 0), tzinfo=timezone.utc)
+
+    def _add(kind: CashFlowKind, value: Decimal, tax_year: int | None, note: str) -> None:
+        if value <= 0:
+            return
+        db.add(Contribution(account_id=account.id, tax_year=tax_year, amount=value,
+                            kind=kind, memo=note[:200], timestamp=stamp))
+
+    if not is_ira:
+        _add(CashFlowKind.CONTRIBUTION, amount, None, memo)
+    elif raw_type.strip().lower() == "rollover":
+        # The file said so. A rollover carries no tax-year designation.
+        _add(CashFlowKind.ROLLOVER, amount, None, memo)
+        stats["rollovers"] += 1
+    else:
+        from app.services import irs
+
+        limit = _annual_limit(db, user, day.year)
+        if limit is None:
+            _add(CashFlowKind.CONTRIBUTION, amount, day.year, memo)
+        else:
+            used = Decimal(db.execute(
+                select(func.coalesce(func.sum(Contribution.amount), 0))
+                .join(Account, Account.id == Contribution.account_id)
+                .where(Account.user_id == user.id,
+                       Account.scenario_id == account.scenario_id,
+                       Account.account_type.in_(irs.IRA_LIKE),
+                       Contribution.tax_year == day.year,
+                       Contribution.kind == CashFlowKind.CONTRIBUTION)
+            ).scalar_one())
+            room = max(ZERO, limit - used)
+            fits = min(amount, room)
+            excess = amount - fits
+            _add(CashFlowKind.CONTRIBUTION, fits, day.year, memo)
+            if excess > 0:
+                _add(CashFlowKind.ROLLOVER, excess, None,
+                     f"{memo} — over the {day.year} limit, carried as a transfer in")
+                stats["over_limit_reclassified"] += 1
     account.settlement_balance = Decimal(account.settlement_balance) + amount
 
 

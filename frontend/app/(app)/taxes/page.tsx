@@ -65,12 +65,15 @@ export default function TaxesPage() {
             What this year&apos;s activity would mean at tax time. FIFO cost basis.
           </p>
         </div>
-        <div className="flex gap-2">
-          <select aria-label="Tax year" className="input w-28" value={year}
+        <div className="flex w-full flex-wrap gap-2 sm:w-auto">
+          <select aria-label="Tax year" className="input w-28 shrink-0" value={year}
                   onChange={(e) => setYear(parseInt(e.target.value, 10))}>
             {years.map((y) => <option key={y} value={y}>{y}</option>)}
           </select>
-          <select aria-label="Account" className="input w-52" value={accountId}
+          {/* takes the leftover width on a phone rather than forcing the row
+              past the viewport at its fixed size */}
+          <select aria-label="Account" className="input min-w-0 flex-1 sm:w-52 sm:flex-none"
+                  value={accountId}
                   onChange={(e) => setAccountId(e.target.value)}>
             <option value="">All accounts</option>
             {accounts.map((a) => (
@@ -105,6 +108,9 @@ export default function TaxesPage() {
           <Card title="Retirement accounts">
             {row("IRA contributions designated to this tax year", report.ira_contributions)}
             {row("Rollovers received", report.rollovers, "not subject to annual limits")}
+            {Number(report.opening_balances) > 0 &&
+              row("Opening balances", report.opening_balances,
+                  "value carried in when this scenario was copied — neither a contribution nor a rollover")}
             {row("Traditional / Rollover IRA withdrawals", report.traditional_withdrawals,
                  "would be ordinary income, plus a 10% penalty before age 59½")}
             {row("Roth IRA withdrawals", report.roth_withdrawals,

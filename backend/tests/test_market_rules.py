@@ -171,7 +171,7 @@ def test_tax_report_after_activity(db, user, taxable):
         _buy(taxable.id, side=OrderSide.SELL, quantity_type=QuantityType.SHARES, quantity=t1.shares_filled),
         OrderSource.API,
     )
-    report = tax_report(db, user, date.today().year)
+    report = tax_report(db, user, date.today().year, taxable.scenario_id)
     assert report.long_term_gains != 0
     assert report.short_term_gains == 0
     assert report.dividends > 0

@@ -55,6 +55,10 @@ celery.conf.update(
             "task": "app.workers.tasks.generate_statements",
             "schedule": crontab(hour=6, minute=15, day_of_month=1),
         },
+        "prune-security-events": {
+            "task": "app.workers.tasks.prune_security_events",
+            "schedule": crontab(hour=4, minute=45),
+        },
         "ensure-irs-limits": {
             "task": "app.workers.tasks.ensure_irs_limits",
             "schedule": crontab(hour=5, minute=0),

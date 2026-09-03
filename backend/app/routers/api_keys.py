@@ -1,12 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.deps import Principal, require_manage
-from app.models import ApiKey, utcnow
+from app.models import ApiKey, SecurityEventKind, utcnow
 from app.schemas import ApiKeyCreatedOut, ApiKeyCreateIn, ApiKeyOut
 from app import security
+from app.services import audit
 
 router = APIRouter(prefix="/api-keys", tags=["api-keys"])
 
@@ -23,7 +24,8 @@ def list_keys(principal: Principal = Depends(require_manage), db: Session = Depe
 
 
 @router.post("", response_model=ApiKeyCreatedOut, status_code=201)
-def create_key(data: ApiKeyCreateIn, principal: Principal = Depends(require_manage),
+def create_key(data: ApiKeyCreateIn, request: Request,
+               principal: Principal = Depends(require_manage),
                db: Session = Depends(get_db)) -> ApiKeyCreatedOut:
     """Creates a new API key with the given name and scopes, capped at 20 active
     keys per user. The plaintext key is returned exactly once in this response
@@ -43,13 +45,17 @@ def create_key(data: ApiKeyCreateIn, principal: Principal = Depends(require_mana
         scopes=",".join(sorted(set(data.scopes))),
     )
     db.add(key)
+    audit.notify(db, principal.user, SecurityEventKind.API_KEY_CREATED, request,
+                 detail=f"{key.name} ({key.scopes})",
+                 extra_rows=[("Key", key.name), ("Scopes", key.scopes)])
     db.commit()
     # raw is returned exactly once and never persisted in plaintext
     return ApiKeyCreatedOut(api_key=ApiKeyOut.model_validate(key), plaintext_key=raw)
 
 
 @router.delete("/{key_id}", status_code=204)
-def revoke_key(key_id: str, principal: Principal = Depends(require_manage),
+def revoke_key(key_id: str, request: Request,
+               principal: Principal = Depends(require_manage),
                db: Session = Depends(get_db)) -> None:
     """Revokes an API key immediately, blocking any further use of it. Returns
     404 if the key does not exist or belongs to another user; revoking an
@@ -59,4 +65,6 @@ def revoke_key(key_id: str, principal: Principal = Depends(require_manage),
         raise HTTPException(status_code=404, detail="API key not found")
     if key.revoked_at is None:
         key.revoked_at = utcnow()
+        audit.notify(db, principal.user, SecurityEventKind.API_KEY_REVOKED, request,
+                     detail=key.name, extra_rows=[("Key", key.name)])
         db.commit()

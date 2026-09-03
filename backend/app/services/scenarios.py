@@ -207,6 +207,12 @@ def _copy_positions(db: Session, user: User, source: Scenario, target: Scenario)
     keeps the ledger self-consistent — the shares are explained by a trade, the
     trade is explained by a deposit — so performance measures the scenario from
     day one instead of inheriting gains that were earned elsewhere.
+
+    That opening deposit is booked as OPENING_BALANCE, not as a rollover and
+    not as a contribution. It consumes no annual IRA room (the money was
+    already inside the wrapper), and it is not a reportable rollover — writing
+    it as one added the entire copied account value to "rollovers received" on
+    the tax summary.
     """
     today = utcnow()
     as_of = today.date()
@@ -250,7 +256,7 @@ def _copy_positions(db: Session, user: User, source: Scenario, target: Scenario)
                 account_id=clone.id,
                 tax_year=None,          # an opening balance is not a contribution year
                 amount=opening,
-                kind=CashFlowKind.ROLLOVER,
+                kind=CashFlowKind.OPENING_BALANCE,
                 memo=f"Opening balance copied from {source.name}",
                 timestamp=stamp,
             ))

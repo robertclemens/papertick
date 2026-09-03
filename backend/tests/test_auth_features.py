@@ -91,11 +91,12 @@ def test_dob_change_flags_catchup_over_contribution(db, user, roth, limits):
     assert any("EXCEED" in w for w in impact.warnings)
 
     with pytest.raises(HTTPException) as exc:
-        update_profile(ProfileUpdateIn(date_of_birth=date(1990, 6, 1)), _principal(user), db)
+        update_profile(ProfileUpdateIn(date_of_birth=date(1990, 6, 1)), _req(), _principal(user), db)
     assert exc.value.status_code == 409
 
     out = update_profile(
-        ProfileUpdateIn(date_of_birth=date(1990, 6, 1), confirm_impacts=True), _principal(user), db
+        ProfileUpdateIn(date_of_birth=date(1990, 6, 1), confirm_impacts=True), _req(),
+        _principal(user), db,
     )
     assert out.user.date_of_birth == date(1990, 6, 1)
     assert out.warnings
@@ -107,12 +108,12 @@ def test_email_change_requires_password_and_applies_in_dev(db, user):
     from app.routers.auth import update_profile
 
     with pytest.raises(HTTPException) as exc:
-        update_profile(ProfileUpdateIn(email="fresh@example.com"), _principal(user), db)
+        update_profile(ProfileUpdateIn(email="fresh@example.com"), _req(), _principal(user), db)
     assert exc.value.status_code == 401
 
     out = update_profile(
         ProfileUpdateIn(email="fresh@example.com", current_password="a-strong-pass-123"),
-        _principal(user), db,
+        _req(), _principal(user), db,
     )
     assert out.email_change == "applied"
     assert out.user.email == "fresh@example.com"
@@ -266,13 +267,13 @@ def test_mfa_gates_the_password_path_but_a_passkey_stands_alone(db, user, monkey
     # passkey path: signed in, TOTP enrolled or not
     monkeypatch.setattr(passkeys, "verify_authentication", lambda db_, flow, cred: user)
     passkey_out = login_verify(
-        PasskeyLoginVerifyIn(flow_id="flow", credential={}), Response(), db
+        PasskeyLoginVerifyIn(flow_id="flow", credential={}), _req(), Response(), db
     )
     assert passkey_out.mfa_required is False and passkey_out.tokens is not None
 
     user.mfa_enabled = False
     db.commit()
-    plain = login_verify(PasskeyLoginVerifyIn(flow_id="flow", credential={}), Response(), db)
+    plain = login_verify(PasskeyLoginVerifyIn(flow_id="flow", credential={}), _req(), Response(), db)
     assert plain.mfa_required is False and plain.tokens is not None
 
 
@@ -297,7 +298,7 @@ def test_passwordless_needs_a_spare_passkey_and_then_refuses_the_password(db, us
     keys = []
     for i in range(2):
         with _pytest.raises(HTTPException) as exc:
-            set_passwordless(body, principal, db)
+            set_passwordless(body, _req(), principal, db)
         assert exc.value.status_code == 422
         row = WebAuthnCredential(user_id=user.id, credential_id=f"cred-{i}",
                                  public_key=f"pk-{i}", nickname=f"Key {i}")
@@ -305,7 +306,7 @@ def test_passwordless_needs_a_spare_passkey_and_then_refuses_the_password(db, us
         db.commit()
         keys.append(row)
 
-    assert set_passwordless(body, principal, db).passkey_only is True
+    assert set_passwordless(body, _req(), principal, db).passkey_only is True
 
     # the password is now refused even though it is correct
     with _pytest.raises(HTTPException) as exc:
@@ -314,7 +315,7 @@ def test_passwordless_needs_a_spare_passkey_and_then_refuses_the_password(db, us
 
     # and the account cannot be whittled back down to a single authenticator
     with _pytest.raises(HTTPException) as exc:
-        delete_passkey(keys[0].id, principal, db)
+        delete_passkey(keys[0].id, _req(), principal, db)
     assert exc.value.status_code == 422
 
 
@@ -372,14 +373,14 @@ def test_password_change_requires_current_and_revokes_sessions(db, user):
     with pytest.raises(HTTPException) as exc:
         change_password(
             PasswordChangeIn(current_password="wrong-one", new_password="another-strong-1"),
-            Response(), _principal(user), db,
+            _req(), Response(), _principal(user), db,
         )
     assert exc.value.status_code == 401
 
     with pytest.raises(HTTPException) as exc:  # too weak
         change_password(
             PasswordChangeIn(current_password="a-strong-pass-123", new_password="short"),
-            Response(), _principal(user), db,
+            _req(), Response(), _principal(user), db,
         )
     assert exc.value.status_code == 422
 
@@ -387,14 +388,14 @@ def test_password_change_requires_current_and_revokes_sessions(db, user):
         change_password(
             PasswordChangeIn(current_password="a-strong-pass-123",
                              new_password="a-strong-pass-123"),
-            Response(), _principal(user), db,
+            _req(), Response(), _principal(user), db,
         )
     assert exc.value.status_code == 422
 
     change_password(
         PasswordChangeIn(current_password="a-strong-pass-123",
                          new_password="a-different-pass-456"),
-        Response(), _principal(user), db,
+        _req(), Response(), _principal(user), db,
     )
     assert security.verify_password("a-different-pass-456", user.password_hash)
     # the old session token is gone; a fresh one was issued for this session

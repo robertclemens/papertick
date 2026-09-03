@@ -35,8 +35,19 @@ def _dec(v) -> Decimal:
     return Decimal(v or 0).quantize(CENT)
 
 
-def tax_report(db: Session, user: User, year: int, account_id: str | None = None,
-               scenario_id: str | None = None) -> TaxYearSummaryOut:
+def tax_report(db: Session, user: User, year: int, scenario_id: str | None,
+               account_id: str | None = None) -> TaxYearSummaryOut:
+    """One tax year, for one scenario.
+
+    `scenario_id` is positional and required. It used to be an optional
+    trailing keyword, and the router did not pass it: every figure here was
+    then summed across *every* scenario the user owned — deleted ones
+    included — so two tracks holding the same imported history reported double
+    the contributions and double the rollovers. A scenario is a self-contained
+    track of data, so a report that spans them is not a bigger report, it is a
+    wrong one. Pass None only to deliberately aggregate a user with no
+    scenarios at all.
+    """
     q = select(Account).where(Account.user_id == user.id)
     if scenario_id:
         q = q.where(Account.scenario_id == scenario_id)
@@ -128,6 +139,12 @@ def tax_report(db: Session, user: User, year: int, account_id: str | None = None
     roth_withdrawals = ZERO - _flows(roth_ids, CashFlowKind.WITHDRAWAL, by_tax_year=False)
     contributions = _flows(ira_ids, CashFlowKind.CONTRIBUTION, by_tax_year=True)
     rollovers = _flows(ira_ids, CashFlowKind.ROLLOVER, by_tax_year=False)
+    # Money an account was opened with when a scenario was copied. Never a
+    # rollover and never a contribution — reported on its own line so the cash
+    # is visible without inflating either of the two figures the IRS cares
+    # about.
+    opening_balances = _flows([a.id for a in accounts],
+                              CashFlowKind.OPENING_BALANCE, by_tax_year=False)
 
     # The 10% additional tax, recomputed from the withdrawals themselves so the
     # figure survives an import or a scenario copy — nothing about it is stored.
@@ -191,6 +208,7 @@ def tax_report(db: Session, user: User, year: int, account_id: str | None = None
         roth_withdrawals=roth_withdrawals,
         ira_contributions=contributions,
         rollovers=rollovers,
+        opening_balances=opening_balances,
         conversions=conv_gross,
         conversion_taxable=conv_taxable,
         early_withdrawal_penalty=penalty,
@@ -212,6 +230,7 @@ def tax_report_csv(report: TaxYearSummaryOut) -> str:
         f"roth_ira_withdrawals,{report.roth_withdrawals}",
         f"ira_contributions_designated,{report.ira_contributions}",
         f"rollovers,{report.rollovers}",
+        f"opening_balances,{report.opening_balances}",
         f"roth_conversions_gross,{report.conversions}",
         f"roth_conversions_taxable,{report.conversion_taxable}",
         f"early_withdrawal_penalty,{report.early_withdrawal_penalty}",

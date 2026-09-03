@@ -11,7 +11,10 @@ export function Card({ title, action, children, className = "" }: {
   return (
     <section className={`card ${className}`}>
       {(title || action) && (
-        <div className="mb-4 flex items-center justify-between gap-3">
+        // `flex-wrap`: a title next to a control group (a range switcher, say)
+        // does not fit on a phone, and without this the header pushes the card
+        // wider than the viewport and the whole page scrolls sideways.
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
           {title && <h2 className="text-sm font-semibold text-slate-200">{title}</h2>}
           {action}
         </div>
@@ -61,6 +64,7 @@ const BADGE_STYLES: Record<string, string> = {
   SELL: "bg-sky-950/60 text-sky-400 border-sky-900",
   CONTRIBUTION: "bg-emerald-950/60 text-emerald-400 border-emerald-900",
   ROLLOVER: "bg-sky-950/60 text-sky-400 border-sky-900",
+  OPENING_BALANCE: "bg-slate-800 text-slate-300 border-slate-700",
   WITHDRAWAL: "bg-amber-950/60 text-amber-400 border-amber-900",
   read: "bg-slate-800 text-slate-300 border-slate-700",
   trade: "bg-emerald-950/60 text-emerald-400 border-emerald-900",

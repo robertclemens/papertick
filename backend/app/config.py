@@ -147,6 +147,9 @@ class Settings(BaseSettings):
     device_verification: bool = True
     device_trust_days: int = 30
     device_otp_ttl_seconds: int = 600
+    # Password-reset links. Short by design: the link is a bearer credential
+    # that can take over the account, and a reset is acted on within minutes.
+    password_reset_ttl_seconds: int = 1800
 
     # How long a deleted scenario is recoverable before it is wiped for good.
     scenario_retention_days: int = 30

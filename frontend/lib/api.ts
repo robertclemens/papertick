@@ -567,6 +567,9 @@ export interface TaxReportT {
   roth_withdrawals: string;
   ira_contributions: string;
   rollovers: string;
+  /** Value an account opened with when a scenario was copied. External money
+   *  in, but neither a contribution nor a reportable rollover. */
+  opening_balances: string;
   conversions: string;              // gross moved into a Roth this year
   conversion_taxable: string;       // the part that is ordinary income
   early_withdrawal_penalty: string; // 10% additional tax, where not excepted

@@ -502,6 +502,7 @@ def _flow_label(kind: str, amount: Decimal) -> str:
     if kind == "CONVERSION":
         return "Roth conversion in" if amount > 0 else "Roth conversion out"
     return {"CONTRIBUTION": "Deposit", "ROLLOVER": "Rollover in",
+            "OPENING_BALANCE": "Opening balance",
             "WITHDRAWAL": "Withdrawal"}.get(kind, kind.title())
 
 

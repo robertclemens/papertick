@@ -30,6 +30,19 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def as_utc(value: datetime | None) -> datetime | None:
+    """Read a stored timestamp back as timezone-aware.
+
+    Every DateTime column here is declared `timezone=True`, which PostgreSQL
+    honours — but SQLite has no such type and hands back a naive datetime, so
+    comparing a stored expiry against `utcnow()` raises rather than answering.
+    Expiry checks go through this so they behave the same on both.
+    """
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
 def SAEnum(e):  # portable across postgres/sqlite
     return Enum(e, native_enum=False, length=32, validate_strings=True)
 
@@ -54,6 +67,17 @@ class CashFlowKind(str, enum.Enum):
     # has no annual limit and no income cap — treating it as a contribution
     # would have it consume IRA room it does not consume.
     CONVERSION = "CONVERSION"
+    # The value an account was *opened* with when a scenario was copied or a
+    # statement history imported: cash plus the market value of the holdings
+    # carried across. Deliberately its own kind rather than a rollover, which
+    # is what it used to be written as. A rollover is a specific, reportable
+    # event — money leaving a retirement plan and landing in an IRA — and
+    # counting an opening balance as one overstates "rollovers received" by the
+    # whole value of the copied account. It is also not a contribution: it
+    # consumes no annual room, because the money was already inside the
+    # wrapper before the copy. It is external money in, and it is reported as
+    # exactly that and nothing else.
+    OPENING_BALANCE = "OPENING_BALANCE"
 
 
 class AssetClass(str, enum.Enum):
@@ -242,6 +266,80 @@ class TrustedDevice(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SecurityEventKind(str, enum.Enum):
+    """Security-relevant things that happen to an account.
+
+    Recorded whether or not an email goes out, so the trail survives a mail
+    relay being down and gives the user one place to answer "was that me?".
+    """
+
+    SIGN_IN = "SIGN_IN"
+    SIGN_IN_BLOCKED = "SIGN_IN_BLOCKED"
+    LOCKOUT = "LOCKOUT"
+    DEVICE_CODE_SENT = "DEVICE_CODE_SENT"
+    DEVICE_TRUSTED = "DEVICE_TRUSTED"
+    DEVICES_REVOKED = "DEVICES_REVOKED"
+    PASSWORD_CHANGED = "PASSWORD_CHANGED"
+    PASSWORD_RESET_REQUESTED = "PASSWORD_RESET_REQUESTED"
+    PASSWORD_RESET_COMPLETED = "PASSWORD_RESET_COMPLETED"
+    EMAIL_CHANGE_REQUESTED = "EMAIL_CHANGE_REQUESTED"
+    EMAIL_CHANGED = "EMAIL_CHANGED"
+    PASSKEY_ADDED = "PASSKEY_ADDED"
+    PASSKEY_REMOVED = "PASSKEY_REMOVED"
+    PASSWORDLESS_ENABLED = "PASSWORDLESS_ENABLED"
+    PASSWORDLESS_DISABLED = "PASSWORDLESS_DISABLED"
+    MFA_ENABLED = "MFA_ENABLED"
+    MFA_DISABLED = "MFA_DISABLED"
+    API_KEY_CREATED = "API_KEY_CREATED"
+    API_KEY_REVOKED = "API_KEY_REVOKED"
+
+
+class SecurityEvent(Base):
+    """One entry in the account's security log.
+
+    The originating IP is the point of the table: it is the only field that
+    says *where* something came from, and it is resolved through the trusted
+    proxy chain (see `rate_limit.client_ip`) rather than read straight off
+    X-Forwarded-For, so a client cannot write its own history.
+    """
+
+    __tablename__ = "security_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[SecurityEventKind] = mapped_column(SAEnum(SecurityEventKind))
+    # IPv6 needs 45 characters; "unknown" when the peer address is unavailable.
+    ip: Mapped[str] = mapped_column(String(45), default="unknown")
+    # Browser and platform family from the User-Agent — coarse by design.
+    device: Mapped[str | None] = mapped_column(String(120), default=None)
+    # What changed, in the user's terms ("old@x.com → new@y.com").
+    detail: Mapped[str | None] = mapped_column(String(300), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                 default=utcnow, index=True)
+
+
+class PasswordResetToken(Base):
+    """A single-use, short-lived credential that authorises one password reset.
+
+    Only the SHA-256 of the token is stored: a database read yields nothing
+    usable, exactly as for refresh tokens and device tokens. `used_at` makes
+    redemption single-use, and every outstanding token for the user is burned
+    when any one of them is redeemed or the password changes by another route,
+    so a link cannot be replayed after the fact.
+    """
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # Where the reset was asked for, so the confirmation email can say so.
+    requested_ip: Mapped[str | None] = mapped_column(String(45), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

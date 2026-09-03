@@ -366,7 +366,7 @@ export default function OptionsPage() {
                 ))}
               </select>
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid gap-3 sm:grid-cols-2">
               <div>
                 <label className="label" htmlFor="ot-action">Action</label>
                 <select id="ot-action" className="input" value={action} onChange={(e) => setAction(e.target.value as Action)}>

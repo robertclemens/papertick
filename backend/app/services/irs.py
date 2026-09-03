@@ -361,15 +361,50 @@ def validate_deposit(
     today = today or date.today()
     warnings: list[str] = []
 
+    # An opening balance is written by a scenario copy, never deposited: it is
+    # the value an account was carried across with, and accepting one here
+    # would let external money enter an IRA outside the annual limit simply by
+    # naming a different kind.
+    if kind == CashFlowKind.OPENING_BALANCE:
+        raise HTTPException(
+            status_code=422,
+            detail=("An opening balance is recorded when a scenario is copied, not "
+                    "deposited. Use CONTRIBUTION, or ROLLOVER for money leaving a "
+                    "retirement plan."),
+        )
+
     if account.account_type == AccountType.TAXABLE:
         if tax_year is not None:
             raise HTTPException(
                 status_code=422,
                 detail="tax_year applies only to IRA accounts",
             )
+        # Checked before the taxable early-return, not after it: a rollover is
+        # money leaving a tax-advantaged plan for another one. There is no such
+        # event for a brokerage account, and letting the kind through unchecked
+        # is what put a six-figure "rollover" on a taxable account and then
+        # reported it as rollover income on the tax summary.
+        if kind == CashFlowKind.ROLLOVER:
+            raise HTTPException(
+                status_code=422,
+                detail=("A taxable brokerage account cannot receive a rollover — a "
+                        "rollover moves money between tax-advantaged accounts. Record "
+                        "this as a deposit instead."),
+            )
         return None, warnings, None
 
     if kind == CashFlowKind.ROLLOVER:
+        if account.account_type == AccountType.ROTH_IRA:
+            # Legal, but only from Roth-side money (a Roth 401(k)/403(b), or
+            # another Roth IRA). Rolling *pre-tax* money in is a conversion and
+            # is taxable, so it must not arrive on this path where nothing is
+            # withheld and no Conversion row starts a five-year clock.
+            warnings.append(
+                "Rollover into a Roth IRA recorded. This is only tax-free from Roth "
+                "money — a Roth 401(k)/403(b) or another Roth IRA. Pre-tax money "
+                "moved into a Roth is a conversion: it is ordinary income and starts "
+                "its own five-year clock, so record it with a Roth conversion instead."
+            )
         warnings.append("Rollover recorded: rollovers do not count toward annual IRA limits.")
         return None, warnings, None
 

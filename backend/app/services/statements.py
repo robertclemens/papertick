@@ -374,6 +374,7 @@ def build_pdf(user: User, data: dict, kind: StatementKind, start: date, end: dat
         label = {
             "CONTRIBUTION": "Deposit",
             "ROLLOVER": "Rollover in",
+            "OPENING_BALANCE": "Opening balance",
             "WITHDRAWAL": "Withdrawal",
             "CONVERSION": "Roth conversion in" if Decimal(f.amount) > 0 else "Roth conversion out",
         }.get(f.kind.value, f.kind.value.title())

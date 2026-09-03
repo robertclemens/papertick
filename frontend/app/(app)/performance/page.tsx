@@ -140,7 +140,7 @@ export default function PerformancePage() {
       <Card
         title="Portfolio value"
         action={
-          <div className="flex gap-1" role="group" aria-label="Chart timeframe">
+          <div className="flex flex-wrap gap-1" role="group" aria-label="Chart timeframe">
             {RANGES.map((r: RangeT) => (
               <button
                 key={r}

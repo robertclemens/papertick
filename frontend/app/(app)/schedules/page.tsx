@@ -273,7 +273,7 @@ export default function SchedulesPage() {
               ))}
             </select>
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid gap-3 sm:grid-cols-2">
             <div>
               <label className="label" htmlFor="s-ticker">Symbol or name</label>
               <SymbolSearch id="s-ticker" value={ticker} onSelect={setTicker}
@@ -302,7 +302,7 @@ export default function SchedulesPage() {
             </div>
           )}
           {USES_MONTH_DAY.includes(cadence) && (
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid gap-3 sm:grid-cols-2">
               {(cadence === "QUARTERLY" || cadence === "ANNUALLY") && (
                 <div>
                   <label className="label" htmlFor="s-moy">

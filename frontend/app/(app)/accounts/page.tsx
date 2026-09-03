@@ -115,7 +115,7 @@ export default function AccountsPage() {
                         refreshing={refreshing} onRefresh={refreshNow} />
         </div>
         <div className="flex items-center gap-2">
-          <div className="flex gap-1" role="group" aria-label="Returns timeframe">
+          <div className="flex flex-wrap gap-1" role="group" aria-label="Returns timeframe">
             {RANGES.map((r) => (
               <button
                 key={r}

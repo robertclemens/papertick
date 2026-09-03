@@ -497,6 +497,28 @@ def backfill_backdated(engine, added: set[tuple[str, str]]) -> None:
                      "ALLOW_BACKDATED_TRADES can be removed from your .env", n)
 
 
+def backfill_opening_balances(engine) -> None:
+    """Reclassify scenario-copy opening balances that were written as rollovers.
+
+    Copying a scenario opens each account with one cash-flow row covering the
+    cash and holdings carried across. That row used to be booked as a ROLLOVER,
+    which put the entire value of the copied account into "rollovers received"
+    on the tax summary — and onto taxable brokerage accounts, which cannot
+    receive a rollover at all. It is now its own kind.
+
+    Matched on the memo the copy writes, so a genuine rollover the user
+    recorded by hand is never touched.
+    """
+    with engine.begin() as conn:
+        n = conn.execute(text(
+            "UPDATE contributions SET kind = 'OPENING_BALANCE' "
+            "WHERE kind = 'ROLLOVER' AND memo LIKE 'Opening balance copied from %'"
+        )).rowcount
+    if n:
+        log.info("schema: reclassified %d scenario-copy opening balance(s) that were "
+                 "recorded as rollovers", n)
+
+
 def main() -> None:
     wait_for_db()
     engine = get_engine()
@@ -506,6 +528,7 @@ def main() -> None:
     added = ensure_schema(engine)
     backfill_backdated(engine, added)
     Base.metadata.create_all(engine)
+    backfill_opening_balances(engine)
     ensure_check_constraints(engine)
     ensure_unique_constraints(engine)
     seed()

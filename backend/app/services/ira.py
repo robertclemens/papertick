@@ -189,6 +189,7 @@ def roth_clock_start_year(db: Session, user: User, scenario_id: str | None) -> i
                 Contribution.account_id.in_(roth_ids),
                 Contribution.kind.in_((CashFlowKind.CONTRIBUTION,
                                        CashFlowKind.ROLLOVER,
+                                       CashFlowKind.OPENING_BALANCE,
                                        CashFlowKind.CONVERSION)),
                 Contribution.amount > 0,
             )
@@ -271,7 +272,8 @@ def roth_contribution_pool(db: Session, user: User, scenario_id: str | None) -> 
     for c in db.execute(
         select(Contribution).where(Contribution.account_id.in_(roth_ids))
     ).scalars():
-        if c.kind in (CashFlowKind.CONTRIBUTION, CashFlowKind.ROLLOVER):
+        if c.kind in (CashFlowKind.CONTRIBUTION, CashFlowKind.ROLLOVER,
+                      CashFlowKind.OPENING_BALANCE):
             total += Decimal(c.amount)
         elif c.kind == CashFlowKind.WITHDRAWAL:
             # withdrawals draw contributions down first, by the ordering rules

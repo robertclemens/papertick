@@ -4,14 +4,14 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import segno
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
 from app.deps import ACCESS_COOKIE, REFRESH_COOKIE, Principal, get_principal, require_manage
-from app.models import RefreshToken, User, utcnow
+from app.models import PasswordResetToken, RefreshToken, SecurityEventKind, User, utcnow
 from app.rate_limit import (
     clear_login_failures,
     client_ip,
@@ -24,6 +24,7 @@ from app.schemas import (
     DeviceLoginIn,
     DobImpactOut,
     EmailTokenIn,
+    ForgotPasswordIn,
     LoginIn,
     LoginOut,
     MfaCodeIn,
@@ -34,14 +35,20 @@ from app.schemas import (
     ProfileUpdateIn,
     ProfileUpdateOut,
     ResendVerificationIn,
+    ResetPasswordIn,
+    SecurityEventOut,
     SignupIn,
     TokenPair,
     TrustedDeviceOut,
     UserOut,
 )
 from app import security
-from app.services import devices, scenarios
-from app.services.mailer import send_email_change_email, send_verification_email
+from app.services import audit, devices, password_reset, scenarios
+from app.services.mailer import (
+    send_email_change_email,
+    send_password_reset_email,
+    send_verification_email,
+)
 
 log = logging.getLogger("papertick.auth")
 
@@ -194,7 +201,13 @@ def login(data: LoginIn, request: Request, response: Response,
         record_login_failure(email, ip)
         raise HTTPException(status_code=401, detail=INVALID_LOGIN)
     if not security.verify_password(data.password, user.password_hash) or not user.is_active:
-        record_login_failure(email, ip)
+        # Told once, on the attempt that engages the lockout. The owner of the
+        # account is the only one who can act on it, and they cannot act on a
+        # message they never get.
+        if record_login_failure(email, ip):
+            audit.notify(db, user, SecurityEventKind.LOCKOUT, request,
+                         detail=f"{get_settings().login_max_failures} failed attempts")
+            db.commit()
         raise HTTPException(status_code=401, detail=INVALID_LOGIN)
     if get_settings().is_production and not user.email_verified:
         raise HTTPException(
@@ -206,6 +219,9 @@ def login(data: LoginIn, request: Request, response: Response,
         # password path. Said plainly: the user turned this on deliberately and
         # needs to know why their password is being refused. It leaks nothing
         # a correct password did not already confirm.
+        audit.record(db, user, SecurityEventKind.SIGN_IN_BLOCKED, request,
+                     detail="password refused: account is passkey-only")
+        db.commit()
         raise HTTPException(
             status_code=403,
             detail="This account signs in with a passkey. Use “Use a passkey” instead.",
@@ -221,8 +237,17 @@ def login(data: LoginIn, request: Request, response: Response,
             device_verification_required=True,
             device_token=devices.start_challenge(db, user, request),
         )
+    # A *completed* sign-in is proof the owner is present, so any reset link
+    # still outstanding is no longer wanted — this is what makes "if this
+    # wasn't you, just ignore it" literally true. Deliberately here and not on
+    # the correct password alone: someone holding a stolen password but not the
+    # second factor would otherwise be able to cancel the real owner's recovery
+    # links on demand, and lock them out of the one route back in.
+    password_reset.burn_outstanding(db, user.id)
     tokens = _issue_tokens(db, user, response)
     _remember_if_applicable(db, user, request, response)
+    audit.record(db, user, SecurityEventKind.SIGN_IN, request, detail="password")
+    db.commit()
     return LoginOut(tokens=tokens)
 
 
@@ -247,18 +272,25 @@ def login_mfa(data: MfaLoginIn, request: Request, response: Response,
         record_login_failure(user.email, ip)
         raise HTTPException(status_code=401, detail="Invalid authentication code")
     clear_login_failures(user.email, ip)
-    return LoginOut(tokens=_issue_tokens(db, user, response))
+    password_reset.burn_outstanding(db, user.id)
+    tokens = _issue_tokens(db, user, response)
+    audit.record(db, user, SecurityEventKind.SIGN_IN, request,
+                 detail="password + authenticator")
+    db.commit()
+    return LoginOut(tokens=tokens)
 
 
 def _remember_if_applicable(db: Session, user: User, request: Request,
                             response: Response) -> None:
-    """Leave a device token behind when device verification is the account's
-    fallback factor and this browser has none yet. Accounts with a passkey or
-    an authenticator never take this path, so no cookie is minted for them."""
+    """Leave a device token behind for a browser that does not have one.
+
+    Reached only when the sign-in did not need a code — which now means the
+    browser was already trusted, or the deployment is not production. It no
+    longer skips accounts that hold a passkey: whether a browser is remembered
+    is a fact about the browser, not about which credentials exist elsewhere.
+    """
     s = get_settings()
     if not (s.device_verification and s.is_production):
-        return
-    if devices.has_second_factor(db, user):
         return
     if devices.is_trusted(db, user, request.cookies.get(devices.DEVICE_COOKIE)):
         return
@@ -278,8 +310,12 @@ def login_device(data: DeviceLoginIn, request: Request, response: Response,
     user = db.get(User, user_id)
     if user is None or not user.is_active:
         raise HTTPException(status_code=401, detail="Invalid or expired code")
+    password_reset.burn_outstanding(db, user.id)
     tokens = _issue_tokens(db, user, response)
     devices.remember(db, user, request, response)
+    audit.record(db, user, SecurityEventKind.SIGN_IN, request,
+                 detail="password + emailed device code")
+    db.commit()
     return LoginOut(tokens=tokens)
 
 
@@ -300,11 +336,14 @@ def revoke_device(device_id: str, principal: Principal = Depends(require_manage)
 
 
 @router.delete("/devices", status_code=204)
-def revoke_all_devices(response: Response, principal: Principal = Depends(require_manage),
+def revoke_all_devices(request: Request, response: Response,
+                       principal: Principal = Depends(require_manage),
                        db: Session = Depends(get_db)) -> None:
     """Forget every remembered browser, this one included."""
     devices.revoke_all(db, principal.user)
     devices.forget_cookie(response)
+    audit.notify(db, principal.user, SecurityEventKind.DEVICES_REVOKED, request)
+    db.commit()
 
 
 @router.post("/refresh", response_model=LoginOut,
@@ -398,8 +437,17 @@ def verify_email(data: EmailTokenIn, db: Session = Depends(get_db)) -> dict:
         ).first()
         if taken:
             raise HTTPException(status_code=409, detail="That email address is already in use")
+        old_email = user.email
         user.email = new_email
         user.email_verified = True
+        rows = [("Previous address", old_email), ("New address", new_email)]
+        # Both addresses are told. The new one because it is now the account's
+        # only way back in, and the old one because losing an account silently
+        # is how a takeover goes unnoticed.
+        audit.notify(db, user, SecurityEventKind.EMAIL_CHANGED, None,
+                     detail=f"{old_email} -> {new_email}", extra_rows=rows, to=old_email)
+        audit.notify(db, user, SecurityEventKind.EMAIL_CHANGED, None,
+                     detail=f"{old_email} -> {new_email}", extra_rows=rows, to=new_email)
         db.commit()
         return {"status": "email_changed", "email": new_email}
 
@@ -419,6 +467,97 @@ def resend_verification(data: ResendVerificationIn, db: Session = Depends(get_db
     return {"status": "sent_if_pending"}
 
 
+# ------------------------------------------------------------------ password reset
+
+@router.post("/password/forgot", status_code=202,
+             dependencies=[Depends(rate_limiter("pw-forgot", 10, 3600, fail_open=False))])
+def forgot_password(data: ForgotPasswordIn, request: Request,
+                    db: Session = Depends(get_db)) -> dict:
+    """Start password recovery: emails a single-use link to the address, if it
+    belongs to an account.
+
+    The response is `{"status": "sent_if_registered"}` whether or not the
+    address exists, and takes the same path either way — the endpoint cannot be
+    used to test which addresses are registered. Nothing about the account
+    changes here; the password stands until the emailed link is redeemed, and
+    signing in with the existing password cancels the link.
+
+    Limited per source address *and* per target address: either alone is
+    bypassable, since a botnet rotates sources and one source can walk many
+    accounts.
+    """
+    email = data.email.lower()
+    enforce_account_limit("pw-forgot", email, 5, 3600)
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if user is not None and user.is_active:
+        ip, device = audit.describe(request)
+        raw = password_reset.issue(db, user, ip)
+        audit.record(db, user, SecurityEventKind.PASSWORD_RESET_REQUESTED, request)
+        db.commit()
+        send_password_reset_email(
+            user.email, raw, ip, device,
+            max(1, get_settings().password_reset_ttl_seconds // 60),
+        )
+    return {"status": "sent_if_registered"}
+
+
+@router.post("/password/reset", status_code=200,
+             dependencies=[Depends(rate_limiter("pw-reset", 20, 3600, fail_open=False))])
+def reset_password(data: ResetPasswordIn, request: Request,
+                   db: Session = Depends(get_db)) -> dict:
+    """Finish password recovery: sets a new password from the emailed link.
+
+    The link is single-use and short-lived, and redeeming it burns every other
+    outstanding link for the account. On success every session is signed out
+    and every remembered browser forgotten — a reset means the account may have
+    been out of its owner's hands, so nothing that predates it survives. The
+    caller is *not* signed in as a result: they sign in with the new password,
+    which proves the reset landed where they think it did.
+
+    An unusable token gives one undifferentiated error. Unknown, already used
+    and expired are deliberately indistinguishable.
+    """
+    try:
+        security.validate_password_strength(data.new_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    user = password_reset.redeem(db, data.token)
+    if user is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This reset link is no longer valid. Request a new one.",
+        )
+    user.password_hash = security.hash_password(data.new_password)
+    # Proving control of the mailbox is exactly what verification asks for, so
+    # an account that reset its password has demonstrably verified its address.
+    user.email_verified = True
+    password_reset.clear_sessions(db, user)
+    audit.notify(db, user, SecurityEventKind.PASSWORD_RESET_COMPLETED, request)
+    db.commit()
+    log.info("password reset completed for %s", user.id)
+    note = None
+    if user.passkey_only:
+        note = ("Password sign-in is still turned off for this account — use a passkey, "
+                "or turn the password path back on in Settings.")
+    return {"status": "reset", "note": note}
+
+
+# ------------------------------------------------------------------ security log
+
+@router.get("/security/activity", response_model=list[SecurityEventOut])
+def security_activity(limit: int = Query(default=50, ge=1, le=200),
+                      principal: Principal = Depends(require_manage),
+                      db: Session = Depends(get_db)) -> list[SecurityEventOut]:
+    """Recent security activity on this account, newest first.
+
+    Each row carries the originating IP address as this deployment resolved it.
+    Behind a reverse proxy that means TRUSTED_PROXY_CIDRS has to name the
+    proxy, or every row reads as the proxy's own address; with the frontend
+    exposed directly it must stay empty, or a caller can name its own.
+    """
+    return [SecurityEventOut.model_validate(e) for e in audit.recent(db, principal.user, limit)]
+
+
 # ------------------------------------------------------------------ profile
 
 def _dob_impact_warnings(db: Session, user: User, new_dob) -> list[str]:
@@ -426,8 +565,14 @@ def _dob_impact_warnings(db: Session, user: User, new_dob) -> list[str]:
     from sqlalchemy import func
 
     ira_like = IRA_TYPES | {AccountType.ROLLOVER_IRA}
+    # Grouped by scenario as well as year, then reduced to the worst scenario
+    # per year. The annual limit is tracked per scenario — each track has its
+    # own contribution history — so summing across them is not a bigger number,
+    # it is a wrong one: two tracks holding the same imported history would
+    # report double the contributions and warn about an over-contribution that
+    # exists in neither.
     rows = db.execute(
-        select(Contribution.tax_year, func.sum(Contribution.amount))
+        select(Account.scenario_id, Contribution.tax_year, func.sum(Contribution.amount))
         .join(Account, Account.id == Contribution.account_id)
         .where(
             Account.user_id == user.id,
@@ -435,9 +580,11 @@ def _dob_impact_warnings(db: Session, user: User, new_dob) -> list[str]:
             Contribution.kind == CashFlowKind.CONTRIBUTION,
             Contribution.tax_year.isnot(None),
         )
-        .group_by(Contribution.tax_year)
+        .group_by(Account.scenario_id, Contribution.tax_year)
     ).all()
-    contributed = {year: Decimal(total) for year, total in rows}
+    contributed: dict[int, Decimal] = {}
+    for _scenario_id, year, total in rows:
+        contributed[year] = max(contributed.get(year, Decimal(0)), Decimal(total))
     years = sorted(set(contributed) | {date.today().year})
     warnings: list[str] = []
     for year in years:
@@ -469,7 +616,7 @@ def _dob_impact_warnings(db: Session, user: User, new_dob) -> list[str]:
 
 @router.post("/password", response_model=UserOut,
              dependencies=[Depends(rate_limiter("password", 5, 3600))])
-def change_password(data: PasswordChangeIn, response: Response,
+def change_password(data: PasswordChangeIn, request: Request, response: Response,
                     principal: Principal = Depends(require_manage),
                     db: Session = Depends(get_db)) -> UserOut:
     """Change the sign-in password. Every other session is signed out (a
@@ -489,6 +636,9 @@ def change_password(data: PasswordChangeIn, response: Response,
     db.query(RefreshToken).filter(
         RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None)
     ).update({"revoked_at": utcnow()})
+    # A reset link minted before this change must not still work after it.
+    password_reset.burn_outstanding(db, user.id)
+    audit.notify(db, user, SecurityEventKind.PASSWORD_CHANGED, request)
     db.commit()
     # Refresh tokens alone are not enough: every access token already issued
     # stays valid for its full lifetime, so a password change would not
@@ -513,7 +663,8 @@ def dob_impact(date_of_birth: date, principal: Principal = Depends(require_manag
 
 @router.patch("/profile", response_model=ProfileUpdateOut,
               dependencies=[Depends(rate_limiter("profile", 10, 3600))])
-def update_profile(data: ProfileUpdateIn, principal: Principal = Depends(require_manage),
+def update_profile(data: ProfileUpdateIn, request: Request,
+                   principal: Principal = Depends(require_manage),
                    db: Session = Depends(get_db)) -> ProfileUpdateOut:
     """Applies profile field updates. A date-of-birth change that would
     affect contribution-limit eligibility is rejected with a 409 (listing the
@@ -560,11 +711,27 @@ def update_profile(data: ProfileUpdateIn, principal: Principal = Depends(require
         ).first()
         if taken:
             raise HTTPException(status_code=409, detail="That email address is already in use")
+        old_email = user.email
         if get_settings().is_production:
-            send_email_change_email(new_email, security.make_email_change_token(user.id, new_email))
+            send_email_change_email(
+                new_email, security.make_email_change_token(user.id, new_email), old_email
+            )
+            # The notice goes to the address currently on file, which is the
+            # one that would be losing access. It names both sides, so the
+            # owner can see exactly what is being changed and to what.
+            audit.notify(db, user, SecurityEventKind.EMAIL_CHANGE_REQUESTED, request,
+                         detail=f"{old_email} -> {new_email}",
+                         extra_rows=[("Current address", old_email),
+                                     ("Requested new address", new_email)],
+                         to=old_email)
             email_change = "verification_sent"
         else:
             user.email = new_email
+            audit.notify(db, user, SecurityEventKind.EMAIL_CHANGED, request,
+                         detail=f"{old_email} -> {new_email}",
+                         extra_rows=[("Previous address", old_email),
+                                     ("New address", new_email)],
+                         to=old_email)
             email_change = "applied"
 
     db.commit()
@@ -600,7 +767,8 @@ def mfa_setup(data: MfaSetupIn, principal: Principal = Depends(require_manage),
 
 
 @router.post("/mfa/enable")
-def mfa_enable(data: MfaCodeIn, principal: Principal = Depends(require_manage),
+def mfa_enable(data: MfaCodeIn, request: Request,
+               principal: Principal = Depends(require_manage),
                db: Session = Depends(get_db)) -> dict:
     """Verifies the code against the secret generated by `/mfa/setup` and, on
     success, turns MFA on for the account."""
@@ -611,12 +779,14 @@ def mfa_enable(data: MfaCodeIn, principal: Principal = Depends(require_manage),
     if secret is None or not security.verify_totp(secret, data.code):
         raise HTTPException(status_code=422, detail="Invalid authentication code")
     user.mfa_enabled = True
+    audit.notify(db, user, SecurityEventKind.MFA_ENABLED, request)
     db.commit()
     return {"mfa_enabled": True}
 
 
 @router.post("/mfa/disable")
-def mfa_disable(data: MfaDisableIn, principal: Principal = Depends(require_manage),
+def mfa_disable(data: MfaDisableIn, request: Request,
+                principal: Principal = Depends(require_manage),
                 db: Session = Depends(get_db)) -> dict:
     """Turns MFA off, requiring both the current password and a valid TOTP
     code as step-up confirmation, and discards the stored secret so a fresh
@@ -631,5 +801,6 @@ def mfa_disable(data: MfaDisableIn, principal: Principal = Depends(require_manag
         raise HTTPException(status_code=422, detail="Invalid authentication code")
     user.mfa_enabled = False
     user.mfa_secret_enc = None
+    audit.notify(db, user, SecurityEventKind.MFA_DISABLED, request)
     db.commit()
     return {"mfa_enabled": False}

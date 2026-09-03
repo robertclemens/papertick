@@ -126,7 +126,7 @@ export default function HistoryPage() {
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 pt-3">
           <div className="flex items-center gap-3">
-            <div className="flex gap-1" role="group" aria-label="History timeframe">
+            <div className="flex flex-wrap gap-1" role="group" aria-label="History timeframe">
               {RANGES.map((r) => (
                 <button
                   key={r}

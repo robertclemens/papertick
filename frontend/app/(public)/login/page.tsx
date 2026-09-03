@@ -16,8 +16,10 @@ import { ErrorText, InfoText } from "@/components/ui";
  *         passkey ceremony with user verification is already two factors, and
  *         chaining a phishable code behind an unphishable credential buys
  *         nothing);
- *       - a code emailed to the account, in production, when the account has
- *         neither a passkey nor TOTP and this browser is not recognised.
+ *       - a code emailed to the account, in production, whenever the password
+ *         was the only thing presented and this browser is not recognised.
+ *         Holding a passkey does not excuse this: a credential the account
+ *         *could* have used is not one this sign-in *did* use.
  *
  *  The email step deliberately does NOT ask the server which methods an
  *  account has: an endpoint that answers "this address has a passkey" is an
@@ -134,7 +136,7 @@ export default function LoginPage() {
   }[step];
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4">
+    <div className="flex min-h-screen items-center justify-center px-4 py-10">
       <div className="w-full max-w-sm">
         <div className="mb-8 text-center">
           <span className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-500 text-xl font-bold text-slate-950">
@@ -205,7 +207,8 @@ export default function LoginPage() {
                 device after you enter it.
               </p>
               <p className="mt-2 text-xs text-slate-500">
-                Adding a passkey or an authenticator app replaces this step entirely.
+                Signing in with a passkey skips this step — a passkey is bound to this
+                site and to your device, so there is nothing to re-verify.
               </p>
             </div>
           )}
@@ -225,6 +228,15 @@ export default function LoginPage() {
               : step === "mfa" || step === "device" ? "Verify code"
               : "Sign in"}
           </button>
+
+          {step === "credential" && (
+            <p className="text-center text-xs text-slate-500">
+              <Link href="/forgot-password"
+                    className="text-slate-400 underline underline-offset-2 hover:text-slate-200">
+                Forgot your password?
+              </Link>
+            </p>
+          )}
 
           {step === "credential" && passkeysSupported() && (
             <>

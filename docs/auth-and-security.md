@@ -6,8 +6,15 @@ Sign-in runs in stages: **email → password or passkey → a second step, if th
 account calls for one.**
 
 - **Passkeys (WebAuthn)** — register any number and sign in with a device screen
-  lock, biometric, or security key. Discoverable credentials, so no username is
-  typed. Requires a secure context (HTTPS, or `localhost` in development).
+  lock, biometric, or a third-party password manager. Discoverable credentials,
+  so no username is typed. Requires a secure context (HTTPS, or `localhost` in
+  development). Both ceremonies send WebAuthn `hints` of `client-device` and
+  `hybrid`: without them iOS cannot tell a passkey request from a
+  hardware-security-key request and leads with "Security Key", so a user whose
+  passkeys live in Bitwarden or 1Password is prompted for hardware they do not
+  have. Hints steer the picker without excluding anyone — a security key still
+  works, and so does scanning a QR code from another device. (On iOS the manager
+  must also be enabled under Settings → General → AutoFill & Passwords.)
   A passkey sign-in **completes on its own, even when TOTP is also enrolled**:
   both ceremonies run with `user_verification=REQUIRED` and enforce the flag on
   the response, so it already proves possession of the authenticator *and* the
@@ -23,14 +30,32 @@ account calls for one.**
   point of failure; the same floor blocks removing a passkey that would drop the
   account below it. The password hash is kept, so the switch is reversible from
   Settings.
-- **New-device verification** — the fallback for accounts with *neither* a
-  passkey nor TOTP. In production, a sign-in from an unrecognised browser must
-  clear a six-digit code emailed to the account; verified browsers are
-  remembered for `DEVICE_TRUST_DAYS` and skip it. Only the SHA-256 of the device
-  token is stored, and the code lives in Redis with a five-attempt budget, never
-  in the database. Development is exempt, or a fresh checkout with no SMTP relay
-  could not be logged into at all. Remembered browsers are listed and revocable
-  under Settings.
+- **New-device verification** — what a **password** sign-in must clear on a
+  browser this account has not used before. In production it applies to every
+  password sign-in, *whether or not the account also holds a passkey or an
+  authenticator*: those are credentials the sign-in could have used, not ones it
+  did, and crediting a passkey's strength to a sign-in that never touched it is
+  factor confusion. A six-digit code is emailed to the account; verified browsers
+  are remembered for `DEVICE_TRUST_DAYS` and skip it. TOTP is asked for earlier
+  on the same path, and a passkey sign-in — being origin-bound and already two
+  factors — never reaches this step at all. Only the SHA-256 of the device token
+  is stored, and the code lives in Redis with a five-attempt budget, never in the
+  database. Development is exempt, or a fresh checkout with no SMTP relay could
+  not be logged into at all. Remembered browsers are listed and revocable under
+  Settings.
+- **Forgotten password** — `/forgot-password` emails a single-use link. The token
+  is 256 bits, stored only as its SHA-256, and expires in
+  `PASSWORD_RESET_TTL_SECONDS` (30 minutes). Requesting a new link burns the
+  previous one, redeeming one burns every other, and a *completed* sign-in
+  cancels them all — so "if this wasn't you, ignore it" is literally true. It is
+  the completed sign-in, not the correct password, on purpose: otherwise someone
+  holding a stolen password but not the second factor could cancel the owner's
+  recovery links on demand. The response is identical for a registered and an unregistered address,
+  so the endpoint cannot be used to test who has an account. A completed reset
+  revokes every session and forgets every remembered browser, and does **not**
+  sign the caller in: they sign in with the new password, which proves the reset
+  landed on the account they meant. Rate-limited per source address *and* per
+  target address, since either alone is bypassable.
 - **Email verification** — required in `ENV=production` for signup and for email
   changes (the address only changes once the link is clicked); skipped in
   development. With no SMTP configured, links are written to the backend log.
@@ -38,6 +63,25 @@ account calls for one.**
   birthdate change is checked against contribution history first and must be
   confirmed if it would move you across the age-50 catch-up threshold or turn a
   past contribution into an over-contribution.
+
+## Security activity and email notices
+
+Every security-relevant event is recorded against the account with the
+originating IP address, the browser and platform family, and what changed —
+sign-ins, lockouts, password and email changes, passkeys added or removed,
+authenticator and passwordless toggles, API keys created or revoked. Settings →
+**Security activity** lists them; rows are pruned after 400 days.
+
+The ones a user would want to know about are also emailed, in a short branded
+message that states what happened, when, from which IP and on what device. An
+email change names **both** addresses — the one on file and the one requested —
+and the notice goes to the address currently on file, which is the one that
+would be losing access; the confirmation, once the change lands, goes to both.
+Emails are multipart (plain text and HTML), load nothing from the network, and
+never carry a password or a code the recipient did not ask for.
+
+Getting the IP right needs `TRUST_PROXY_HEADERS` on the frontend and
+`TRUSTED_PROXY_CIDRS` on the backend — see [reverse-proxy.md](reverse-proxy.md).
 
 ## Security posture
 
@@ -59,7 +103,10 @@ account calls for one.**
   to the Host values it legitimately sees (`backend`, `127.0.0.1`) — a spoofed
   *public* Host is rejected by the reverse proxy, which matches one hostname.
   `X-Forwarded-For` is believed only from CIDRs you list in `TRUSTED_PROXY_CIDRS`
-  (nothing, by default), so a caller cannot choose its own rate-limit bucket.
+  (nothing, by default) and only when the frontend has been told a real proxy is
+  in front (`TRUST_PROXY_HEADERS`, false by default), and the chain is read from
+  the right — so a caller cannot choose its own rate-limit bucket or its own
+  entry in the security log.
 - Strict Pydantic validation with bounds on every money/shares input; request bodies
   capped at 8 MiB before parsing; only US-listed USD symbols the market-data source
   can confirm become tradable. Security headers and a strict CSP on both services;

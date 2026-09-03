@@ -142,4 +142,17 @@ below is what those lines actually mean.
   OpenAPI spec. Scoped API keys (`read`, `trade`) via `Authorization: Bearer ptk_…`
   cover reading and trading; creating accounts, managing scenarios and changing
   credentials need a signed-in session (see [the API guide](api.md)).
+- **Account security** — passkeys (WebAuthn, discoverable, user-verification
+  enforced) with hints that make a third-party password manager the offer on iOS
+  rather than a hardware security key; optional TOTP; optional passwordless. In
+  production a *password* sign-in from an unrecognised browser must clear a code
+  emailed to the account — including on accounts that hold passkeys, because a
+  credential that was not used proves nothing about the sign-in that skipped it.
+  Forgotten-password recovery is a single-use, short-lived, hash-stored link that
+  reveals nothing about whether an address is registered. Every sign-in and every
+  security change is recorded with its originating IP and emailed to the account
+  owner (see [auth and security](auth-and-security.md)).
+- **Responsive UI** — the same pages from a 320px phone to a wide desktop: the
+  navigation rail becomes a drawer, wide tables scroll inside their own card
+  rather than the page, and touch targets are sized for a finger.
 

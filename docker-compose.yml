@@ -13,7 +13,15 @@ x-backend-env: &backend-env
   # Host values this deployment answers to; empty disables the check.
   ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
   # CIDRs of proxies whose X-Forwarded-For may be believed. Empty = trust none,
-  # so a client cannot choose its own rate-limit bucket.
+  # so a client cannot choose its own rate-limit bucket or its own audit trail.
+  #
+  # The frontend proxies /api to this service, so the peer the backend sees is
+  # always the frontend container. To record the real client address instead,
+  # set this to the compose network (172.16.0.0/12 covers the default bridge)
+  # AND set TRUST_PROXY_HEADERS=true on the frontend — but only when a reverse
+  # proxy that rewrites X-Forwarded-For (Caddy, nginx) is genuinely in front.
+  # Setting it with the frontend exposed directly lets any caller name its own
+  # address. See docs/reverse-proxy.md.
   TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
   MARKET_DATA_PROVIDER: ${MARKET_DATA_PROVIDER:-auto}
   # Keyless backstop for a Yahoo outage. Equities and ETFs only — its
@@ -204,6 +212,13 @@ services:
       BACKEND_URL: http://backend:8000
       BASE_PATH: ${BASE_PATH:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      # Believe the X-Forwarded-For on inbound requests, because a reverse proxy
+      # in front has already set it. Leave false when this container is reachable
+      # directly: the header is then client input, and forwarding it would let a
+      # caller forge its own address in the security log and the rate limiter.
+      # Pairs with TRUSTED_PROXY_CIDRS on the backend — both are needed, and
+      # neither is useful alone. See docs/reverse-proxy.md.
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
     depends_on:
       backend:
         condition: service_healthy

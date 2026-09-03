@@ -62,7 +62,8 @@ def get_tax_report(
     Defaults to the current year; narrow to one account with `account_id`."""
     if account_id:
         owned_account(account_id, principal, db)
-    return tax_report(db, principal.user, year or date.today().year, account_id)
+    return tax_report(db, principal.user, year or date.today().year,
+                      principal.scenario_id, account_id)
 
 
 @router.get("/report.csv", response_class=PlainTextResponse)
@@ -75,7 +76,8 @@ def get_tax_report_csv(
     """The same report as `/report`, as a downloadable CSV attachment."""
     if account_id:
         owned_account(account_id, principal, db)
-    report = tax_report(db, principal.user, year or date.today().year, account_id)
+    report = tax_report(db, principal.user, year or date.today().year,
+                        principal.scenario_id, account_id)
     return PlainTextResponse(
         tax_report_csv(report),
         media_type="text/csv",
